@@ -2,18 +2,18 @@ import uuid
 
 import pytest
 import random
+import string
 import json
 from pulpcore.client.pulpcore import ApiException
-from pulpcore.app import settings
 
 from pulpcore.tests.functional.utils import PulpTaskError
 
 
 @pytest.mark.parallel
-def test_crud_domains(domains_api_client, monitor_task):
+def test_crud_domains(pulpcore_bindings, monitor_task):
     """Perform basic CRUD operations on Domains."""
     # List domains, "default" domain should always be present
-    domains = domains_api_client.list()
+    domains = pulpcore_bindings.DomainsApi.list()
     assert domains.count >= 1
 
     # Create some domains
@@ -22,7 +22,7 @@ def test_crud_domains(domains_api_client, monitor_task):
         "storage_class": "pulpcore.app.models.storage.FileSystem",
         "storage_settings": {"MEDIA_ROOT": ""},
     }
-    domain = domains_api_client.create(body)
+    domain = pulpcore_bindings.DomainsApi.create(body)
     assert domain.storage_class == body["storage_class"]
     assert domain.name == body["name"]
     valid_settings = {
@@ -36,29 +36,30 @@ def test_crud_domains(domains_api_client, monitor_task):
 
     # Update the domain
     update_body = {"storage_settings": {"location": "/testing/"}}
-    response = domains_api_client.partial_update(domain.pulp_href, update_body)
+    response = pulpcore_bindings.DomainsApi.partial_update(domain.pulp_href, update_body)
     monitor_task(response.task)
 
     # Read updated domain
-    domain = domains_api_client.read(domain.pulp_href)
+    domain = pulpcore_bindings.DomainsApi.read(domain.pulp_href)
     valid_settings["location"] = "/testing/"
     assert domain.storage_settings == valid_settings
 
     # Delete the domain
-    response = domains_api_client.delete(domain.pulp_href)
+    response = pulpcore_bindings.DomainsApi.delete(domain.pulp_href)
     monitor_task(response.task)
 
 
 @pytest.mark.parallel
-def test_default_domain(domains_api_client):
+def test_default_domain(pulpcore_bindings, pulp_settings):
     """Test properties around the default domain."""
-    domains = domains_api_client.list(name="default")
+    settings = pulp_settings
+    domains = pulpcore_bindings.DomainsApi.list(name="default")
     assert domains.count == 1
 
     # Read the default domain, ensure storage is set to default
     default_domain = domains.results[0]
     assert default_domain.name == "default"
-    assert default_domain.storage_class == settings.DEFAULT_FILE_STORAGE
+    assert default_domain.storage_class == settings.STORAGES["default"]["BACKEND"]
     assert default_domain.redirect_to_object_storage == settings.REDIRECT_TO_OBJECT_STORAGE
     assert default_domain.hide_guarded_distributions == settings.HIDE_GUARDED_DISTRIBUTIONS
 
@@ -69,7 +70,7 @@ def test_default_domain(domains_api_client):
         "storage_settings": {"MEDIA_ROOT": ""},
     }
     with pytest.raises(ApiException) as e:
-        domains_api_client.create(body)
+        pulpcore_bindings.DomainsApi.create(body)
 
     assert e.value.status == 400
     assert json.loads(e.value.body) == {"name": ["This field must be unique."]}
@@ -77,22 +78,23 @@ def test_default_domain(domains_api_client):
     # Try to update the default domain
     update_body = {"name": "no-longer-default"}
     with pytest.raises(ApiException) as e:
-        domains_api_client.partial_update(default_domain.pulp_href, update_body)
+        pulpcore_bindings.DomainsApi.partial_update(default_domain.pulp_href, update_body)
 
     assert e.value.status == 400
     assert json.loads(e.value.body) == ["Default domain can not be updated."]
 
     # Try to delete the default domain
     with pytest.raises(ApiException) as e:
-        domains_api_client.delete(default_domain.pulp_href)
+        pulpcore_bindings.DomainsApi.delete(default_domain.pulp_href)
 
     assert e.value.status == 400
     assert json.loads(e.value.body) == ["Default domain can not be deleted."]
 
 
 @pytest.mark.parallel
-def test_active_domain_deletion(domains_api_client, rbac_contentguard_api_client, monitor_task):
+def test_active_domain_deletion(pulpcore_bindings, monitor_task, pulp_settings):
     """Test trying to delete a domain that is in use, has objects in it."""
+    settings = pulp_settings
     if not settings.DOMAIN_ENABLED:
         pytest.skip("Domains not enabled")
     name = str(uuid.uuid4())
@@ -101,40 +103,41 @@ def test_active_domain_deletion(domains_api_client, rbac_contentguard_api_client
         "storage_class": "pulpcore.app.models.storage.FileSystem",
         "storage_settings": {"location": ""},
     }
-    domain = domains_api_client.create(body)
+    domain = pulpcore_bindings.DomainsApi.create(body)
 
     guard_body = {"name": name}
-    guard = rbac_contentguard_api_client.create(guard_body, pulp_domain=name)
+    guard = pulpcore_bindings.ContentguardsRbacApi.create(guard_body, pulp_domain=name)
     assert name in guard.pulp_href
 
     # Try to delete a domain with an object in it
-    response = domains_api_client.delete(domain.pulp_href)
+    response = pulpcore_bindings.DomainsApi.delete(domain.pulp_href)
     with pytest.raises(PulpTaskError) as e:
         monitor_task(response.task)
 
     assert e.value.task.state == "failed"
 
     # Delete the content guard
-    rbac_contentguard_api_client.delete(guard.pulp_href)
+    pulpcore_bindings.ContentguardsRbacApi.delete(guard.pulp_href)
 
     # Now succeed in deleting the domain
-    response = domains_api_client.delete(domain.pulp_href)
+    response = pulpcore_bindings.DomainsApi.delete(domain.pulp_href)
     monitor_task(response.task)
     with pytest.raises(ApiException) as e:
-        domains_api_client.read(domain.pulp_href)
+        pulpcore_bindings.DomainsApi.read(domain.pulp_href)
     assert e.value.status == 404
 
 
 @pytest.mark.parallel
 def test_orphan_domain_deletion(
-    domains_api_client,
-    file_repository_api_client,
-    file_content_api_client,
+    pulpcore_bindings,
+    file_bindings,
     gen_object_with_cleanup,
     monitor_task,
     tmp_path,
+    pulp_settings,
 ):
     """Test trying to delete a domain that is in use, has objects in it."""
+    settings = pulp_settings
     if not settings.DOMAIN_ENABLED:
         pytest.skip("Domains not enabled")
     body = {
@@ -142,43 +145,44 @@ def test_orphan_domain_deletion(
         "storage_class": "pulpcore.app.models.storage.FileSystem",
         "storage_settings": {"MEDIA_ROOT": "/var/lib/pulp/media/"},
     }
-    domain = gen_object_with_cleanup(domains_api_client, body)
+    domain = gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body)
 
     repository = gen_object_with_cleanup(
-        file_repository_api_client, {"name": str(uuid.uuid4())}, pulp_domain=domain.name
+        file_bindings.RepositoriesFileApi, {"name": str(uuid.uuid4())}, pulp_domain=domain.name
     )
     new_file = tmp_path / "new_file"
     new_file.write_text("Test file")
     monitor_task(
-        file_content_api_client.create(
+        file_bindings.ContentFilesApi.create(
             relative_path=str(uuid.uuid4()),
-            file=new_file,
+            file=str(new_file),
             pulp_domain=domain.name,
             repository=repository.pulp_href,
         ).task
     )
 
     # Try to delete a domain with the repository in it
-    response = domains_api_client.delete(domain.pulp_href)
+    response = pulpcore_bindings.DomainsApi.delete(domain.pulp_href)
     with pytest.raises(PulpTaskError) as e:
         monitor_task(response.task)
 
     assert e.value.task.state == "failed"
 
     # Delete the repository
-    file_repository_api_client.delete(repository.pulp_href)
+    file_bindings.RepositoriesFileApi.delete(repository.pulp_href)
 
     # Now succeed in deleting the domain
-    response = domains_api_client.delete(domain.pulp_href)
+    response = pulpcore_bindings.DomainsApi.delete(domain.pulp_href)
     monitor_task(response.task)
     with pytest.raises(ApiException) as e:
-        domains_api_client.read(domain.pulp_href)
+        pulpcore_bindings.DomainsApi.read(domain.pulp_href)
     assert e.value.status == 404
 
 
 @pytest.mark.parallel
-def test_special_domain_creation(domains_api_client, gen_object_with_cleanup):
+def test_special_domain_creation(pulpcore_bindings, gen_object_with_cleanup, pulp_settings):
     """Test many possible domain creation scenarios."""
+    settings = pulp_settings
     if not settings.DOMAIN_ENABLED:
         pytest.skip("Domains not enabled")
     # This test needs to account for which environment it is running in
@@ -235,7 +239,7 @@ def test_special_domain_creation(domains_api_client, gen_object_with_cleanup):
         if backend == "pulpcore.app.models.storage.PulpSFTPStorage":
             body["redirect_to_object_storage"] = False
         try:
-            domain = gen_object_with_cleanup(domains_api_client, body)
+            domain = gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body)
         except ApiException as e:
             assert e.status == 400
             assert "Backend is not installed on Pulp." in e.body
@@ -249,7 +253,7 @@ def test_special_domain_creation(domains_api_client, gen_object_with_cleanup):
             "storage_class": backend,
             "storage_settings": storage_settings[backend],
         }
-        domain = gen_object_with_cleanup(domains_api_client, body)
+        domain = gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body)
         domain_names.add(domain.name)
 
     # Try creating domains with incorrect settings
@@ -261,20 +265,38 @@ def test_special_domain_creation(domains_api_client, gen_object_with_cleanup):
             "storage_settings": storage_settings[random_backend],
         }
         with pytest.raises(ApiException) as e:
-            gen_object_with_cleanup(domains_api_client, body)
+            gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body)
 
         assert e.value.status == 400
         error_body = json.loads(e.value.body)
         assert "storage_settings" in error_body
         assert "Unexpected field" in error_body["storage_settings"].values()
 
+    # Try creating domains with a name greater than max_length
+    letters = string.ascii_lowercase
+    name = "".join(random.choice(letters) for i in range(80))
+    backend = installed_backends[0]
+    body = {
+        "name": name,
+        "storage_class": backend,
+        "storage_settings": storage_settings[backend],
+    }
+    with pytest.raises((ApiException, ValueError)) as e:
+        gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body)
+
+    if isinstance(e.value, ApiException):
+        assert e.value.status == 400
+        assert "Ensure this field has no more than 50 characters." in e.value.body
+    else:
+        assert "String should have at most 50 characters" in str(e.value)
+
     # Check that all domains are "apart" of the default domain
-    domains = domains_api_client.list()
+    domains = pulpcore_bindings.DomainsApi.list()
     for domain in domains.results:
         assert "default/api/v3/" in domain.pulp_href
     # Check that operations on domains in another "domain" doesn't change href
     random_name = random.choice(tuple(domain_names - {"default"}))
-    domains = domains_api_client.list(pulp_domain=random_name)
+    domains = pulpcore_bindings.DomainsApi.list(pulp_domain=random_name)
     for domain in domains.results:
         assert "default/api/v3/" in domain.pulp_href
 
@@ -283,6 +305,6 @@ def test_special_domain_creation(domains_api_client, gen_object_with_cleanup):
         "storage_class": "pulpcore.app.models.storage.FileSystem",
         "storage_settings": {"MEDIA_ROOT": ""},
     }
-    domain = gen_object_with_cleanup(domains_api_client, body, pulp_domain=random_name)
+    domain = gen_object_with_cleanup(pulpcore_bindings.DomainsApi, body, pulp_domain=random_name)
     assert "default/api/v3/" in domain.pulp_href
     assert random_name not in domain.pulp_href

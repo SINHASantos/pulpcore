@@ -8,8 +8,6 @@ from pulpcore.app.serializers import (
     IdentityField,
     ModelSerializer,
 )
-
-
 from pulpcore.app.models import UpstreamPulp
 
 
@@ -75,15 +73,30 @@ class UpstreamPulpSerializer(ModelSerializer, HiddenFieldsMixin):
         help_text="Timestamp of the most recent update of the remote.", read_only=True
     )
 
-    pulp_label_select = serializers.CharField(
+    q_select = serializers.CharField(
         help_text=_(
-            "One or more comma separated labels that will be used to filter distributions on the "
-            'upstream Pulp. E.g. "foo=bar,key=val" or "foo,key"'
+            "Filter distributions on the upstream Pulp using complex filtering. E.g. "
+            'pulp_label_select="foo" OR pulp_label_select="key=val"',
         ),
         allow_null=True,
         allow_blank=True,
         required=False,
     )
+
+    last_replication = serializers.DateTimeField(
+        help_text=_(
+            "Timestamp of the last replication that occurred. Equals to 'null' if no "
+            "replication task has been executed."
+        ),
+        read_only=True,
+    )
+
+    def validate_q_select(self, value):
+        """Ensure we have a valid q_select expression."""
+        from pulpcore.app.viewsets import DistributionFilter
+
+        DistributionFilter().filters["q"].field.clean(value)
+        return value
 
     class Meta:
         abstract = True
@@ -101,5 +114,6 @@ class UpstreamPulpSerializer(ModelSerializer, HiddenFieldsMixin):
             "password",
             "pulp_last_updated",
             "hidden_fields",
-            "pulp_label_select",
+            "q_select",
+            "last_replication",
         )

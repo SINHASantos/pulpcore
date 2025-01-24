@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.viewsets import GenericViewSet
 from urllib.parse import urlparse
 
+from pulpcore.constants import PROTECTED_REPO_VERSION_MESSAGE
 from pulpcore.filters import BaseFilterSet
 from pulpcore.app import tasks
 from pulpcore.app.models import (
@@ -22,6 +23,7 @@ from pulpcore.app.models import (
 from pulpcore.app.response import OperationPostponedResponse
 from pulpcore.app.serializers import (
     AsyncOperationResponseSerializer,
+    GenericRemoteSerializer,
     RemoteSerializer,
     RepairSerializer,
     RepositorySerializer,
@@ -30,6 +32,7 @@ from pulpcore.app.serializers import (
 from pulpcore.app.viewsets import (
     AsyncRemoveMixin,
     AsyncUpdateMixin,
+    LabelsMixin,
     NamedModelViewSet,
 )
 from pulpcore.app.viewsets.base import (
@@ -37,9 +40,10 @@ from pulpcore.app.viewsets.base import (
     NAME_FILTER_OPTIONS,
     NULLABLE_NUMERIC_FILTER_OPTIONS,
 )
-from pulpcore.app.viewsets.custom_filters import LabelFilter
+from pulpcore.app.viewsets.custom_filters import LabelFilter, WithContentFilter, WithContentInFilter
 from pulpcore.tasking.tasks import dispatch
 from pulpcore.filters import HyperlinkRelatedFilter
+from pulpcore.app.util import resolve_prn
 
 
 class RepositoryContentFilter(Filter):
@@ -48,7 +52,7 @@ class RepositoryContentFilter(Filter):
     """
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("help_text", _("Content Unit referenced by HREF"))
+        kwargs.setdefault("help_text", _("Content Unit referenced by HREF/PRN"))
         self.latest = kwargs.pop("latest", False)
         super().__init__(*args, **kwargs)
 
@@ -56,7 +60,7 @@ class RepositoryContentFilter(Filter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Repository Queryset
-            value (string): of content href to filter
+            value (string): of content href/prn to filter
 
         Returns:
             Queryset of the Repository containing the specified content
@@ -163,47 +167,18 @@ class ImmutableRepositoryViewSet(
     mixins.CreateModelMixin,
     AsyncRemoveMixin,
 ):
+    # Too many cascaded deletes to block the gunicorn worker.
+    ALLOW_NON_BLOCKING_DELETE = False
+
     """
     An immutable repository ViewSet that does not allow the usage of the methods PATCH and PUT.
     """
 
 
-class RepositoryViewSet(ImmutableRepositoryViewSet, AsyncUpdateMixin):
+class RepositoryViewSet(ImmutableRepositoryViewSet, AsyncUpdateMixin, LabelsMixin):
     """
     A ViewSet for an ordinary repository.
     """
-
-
-class RepositoryVersionContentFilter(Filter):
-    """
-    Filter used to get the repository versions where some given content can be found.
-    """
-
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("help_text", _("Content Unit referenced by HREF"))
-        super().__init__(*args, **kwargs)
-
-    def filter(self, qs, value):
-        """
-        Args:
-            qs (django.db.models.query.QuerySet): The RepositoryVersion Queryset
-            value (string): of content href to filter
-
-        Returns:
-            Queryset of the RepositoryVersions containing the specified content
-        """
-
-        if value is None:
-            # user didn't supply a value
-            return qs
-
-        if not value:
-            raise serializers.ValidationError(detail=_("No value supplied for content filter"))
-
-        # Get the content object from the content_href
-        content = NamedModelViewSet.get_resource(value, Content)
-
-        return qs.with_content([content.pk])
 
 
 class RepositoryVersionFilter(BaseFilterSet):
@@ -213,24 +188,35 @@ class RepositoryVersionFilter(BaseFilterSet):
     # /?pulp_created__gte=2018-04-12T19:45
     # /?pulp_created__range=2018-04-12T19:45,2018-04-13T20:00
     # /?content=/pulp/api/v3/content/file/fb8ad2d0-03a8-4e36-a209-77763d4ed16c/
-    content = RepositoryVersionContentFilter()
-    content__in = RepositoryVersionContentFilter(field_name="content", lookup_expr="in")
+    content = WithContentFilter()
+    content__in = WithContentInFilter()
 
     def filter_pulp_href(self, queryset, name, value):
         """Special handling for RepositoryVersion HREF filtering."""
         repo_versions = defaultdict(list)
+        repo_version_pks = []
         for uri in value:
-            try:
-                href_match = resolve(urlparse(uri).path).kwargs
-            except Resolver404:
-                href_match = {}
-            if "repository_pk" not in href_match or "number" not in href_match:
-                raise serializers.ValidationError(
-                    _("Invalid RepositoryVersion HREF: {}".format(uri))
-                )
-            repo_versions[href_match["repository_pk"]].append(int(href_match["number"]))
+            if uri.startswith("prn:"):
+                model, pk = resolve_prn(uri)
+                if model != RepositoryVersion:
+                    raise serializers.ValidationError(
+                        _("Invalid RepositoryVersion PRN: {}").format(uri)
+                    )
+                repo_version_pks.append(pk)
+            else:
+                try:
+                    href_match = resolve(urlparse(uri).path).kwargs
+                except Resolver404:
+                    href_match = {}
+                if "repository_pk" not in href_match or "number" not in href_match:
+                    raise serializers.ValidationError(
+                        _("Invalid RepositoryVersion HREF: {}".format(uri))
+                    )
+                repo_versions[href_match["repository_pk"]].append(int(href_match["number"]))
 
         filter_Q = Q()
+        if repo_version_pks:
+            filter_Q |= Q(pk__in=repo_version_pks)
         for repo_pk, numbers in repo_versions.items():
             filter_Q |= Q(repository__pk=repo_pk, number__in=numbers)
         return queryset.filter(filter_Q)
@@ -292,6 +278,9 @@ class RepositoryVersionViewSet(
         """
         version = self.get_object()
 
+        if version in version.repository.protected_versions():
+            raise serializers.ValidationError(PROTECTED_REPO_VERSION_MESSAGE)
+
         task = dispatch(
             tasks.repository.delete_version,
             exclusive_resources=[version.repository],
@@ -342,7 +331,7 @@ class RemoteFilter(BaseFilterSet):
 class ListRemoteViewSet(NamedModelViewSet, mixins.ListModelMixin):
     endpoint_name = "remotes"
     queryset = Remote.objects.all()
-    serializer_class = RemoteSerializer
+    serializer_class = GenericRemoteSerializer
     filterset_class = RemoteFilter
 
     DEFAULT_ACCESS_POLICY = {
@@ -369,7 +358,11 @@ class RemoteViewSet(
     mixins.ListModelMixin,
     AsyncUpdateMixin,
     AsyncRemoveMixin,
+    LabelsMixin,
 ):
+    # Too many cascaded deletes to block the gunicorn worker.
+    ALLOW_NON_BLOCKING_DELETE = False
+
     endpoint_name = "remotes"
     serializer_class = RemoteSerializer
     queryset = Remote.objects.all()

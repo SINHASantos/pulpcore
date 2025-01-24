@@ -8,16 +8,19 @@ from .base import (
     DetailRelatedField,
     DomainUniqueValidator,
     GetOrCreateSerializerMixin,
+    HiddenFieldsMixin,
     IdentityField,
     ModelSerializer,
     NestedIdentityField,
     NestedRelatedField,
+    PRNField,
     RelatedField,
     RelatedResourceField,
+    SetLabelSerializer,
     TaskGroupOperationResponseSerializer,
+    UnsetLabelSerializer,
     ValidateFieldsMixin,
     validate_unknown_fields,
-    HiddenFieldsMixin,
 )
 from .fields import (
     BaseURLField,
@@ -27,6 +30,8 @@ from .fields import (
     ImportsIdentityFromImporterField,
     ImportRelatedField,
     ImportIdentityField,
+    JSONDictField,
+    JSONListField,
     LatestVersionField,
     SingleContentArtifactField,
     RepositoryVersionsIdentityFromRepositoryField,
@@ -49,7 +54,7 @@ from .content import (
     SigningServiceSerializer,
     SingleArtifactContentSerializer,
 )
-from .domain import DomainSerializer
+from .domain import DomainSerializer, DomainBackendMigratorSerializer
 from .exporter import (
     ExporterSerializer,
     ExportSerializer,
@@ -75,11 +80,14 @@ from .publication import (
     PublicationSerializer,
     RBACContentGuardSerializer,
     RBACContentGuardPermissionSerializer,
+    CompositeContentGuardSerializer,
     ContentRedirectContentGuardSerializer,
+    HeaderContentGuardSerializer,
     ArtifactDistributionSerializer,
 )
 from .purge import PurgeSerializer
 from .repository import (
+    GenericRemoteSerializer,
     RemoteSerializer,
     RepositorySerializer,
     RepositorySyncURLSerializer,
@@ -106,9 +114,15 @@ from .user import (
     GroupRoleSerializer,
     GroupSerializer,
     GroupUserSerializer,
+    LoginSerializer,
     NestedRoleSerializer,
     RoleSerializer,
     UserRoleSerializer,
     UserSerializer,
 )
 from .replica import UpstreamPulpSerializer
+from .openpgp import (
+    OpenPGPDistributionSerializer,
+    OpenPGPKeyringSerializer,
+    OpenPGPPublicKeySerializer,
+)

@@ -165,7 +165,9 @@ class RemoteSerializer(ModelSerializer, HiddenFieldsMixin):
     )
     policy = serializers.ChoiceField(
         help_text="The policy to use when downloading content.",
-        choices=((models.Remote.IMMEDIATE, "When syncing, download all metadata and content now.")),
+        choices=(
+            (models.Remote.IMMEDIATE, "When syncing, download all metadata and content now."),
+        ),
         default=models.Remote.IMMEDIATE,
     )
 
@@ -323,6 +325,14 @@ class RemoteSerializer(ModelSerializer, HiddenFieldsMixin):
         )
 
 
+class GenericRemoteSerializer(RemoteSerializer):
+    policy = serializers.ChoiceField(
+        help_text="The policy to use when downloading content.",
+        choices=models.Remote.POLICY_CHOICES,
+        default=models.Remote.IMMEDIATE,
+    )
+
+
 class RepositorySyncURLSerializer(ValidateFieldsMixin, serializers.Serializer):
     remote = DetailRelatedField(
         required=False,
@@ -375,9 +385,13 @@ class ContentSummarySerializer(serializers.Serializer):
 
         """
         to_return = {"added": {}, "removed": {}, "present": {}}
+        request = self.context.get("request")
         for count_detail in obj.counts.all():
             count_type = count_detail.get_count_type_display()
-            item_dict = {"count": count_detail.count, "href": count_detail.content_href}
+            item_dict = {
+                "count": count_detail.count,
+                "href": count_detail.get_content_href(request=request),
+            }
             to_return[count_type][count_detail.content_type] = item_dict
 
         return to_return

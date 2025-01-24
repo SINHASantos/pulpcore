@@ -180,11 +180,12 @@ def has_remote_param_obj_perms(request, view, action, permission):
     """
     kwargs = {}
     obj = view.get_object() if view.detail else None
+    context = {"request": request}
+    if obj:
+        context["repository_pk"] = obj.pk
     if action == "partial_update":
         kwargs["partial"] = True
-    serializer = view.serializer_class(
-        instance=obj, data=request.data, context={"request": request}, **kwargs
-    )
+    serializer = view.serializer_class(instance=obj, data=request.data, context=context, **kwargs)
     serializer.is_valid(raise_exception=True)
     if remote := serializer.validated_data.get("remote"):
         return request.user.has_perm(permission, remote)
@@ -423,9 +424,9 @@ def has_repo_or_repo_ver_param_model_or_domain_or_obj_perms(request, view, actio
     )
     serializer.is_valid(raise_exception=True)
     if repository := serializer.validated_data.get("repository"):
-        return request.user.has_perm(permission, repository)
+        return request.user.has_perm(permission, repository.cast())
     elif repo_ver := serializer.validated_data.get("repository_version"):
-        return request.user.has_perm(permission, repo_ver.repository)
+        return request.user.has_perm(permission, repo_ver.repository.cast())
     return True
 
 
@@ -478,9 +479,9 @@ def has_repo_or_repo_ver_param_model_or_obj_perms(request, view, action, permiss
     )
     serializer.is_valid(raise_exception=True)
     if repository := serializer.validated_data.get("repository"):
-        return request.user.has_perm(permission, repository)
+        return request.user.has_perm(permission, repository.cast())
     elif repo_ver := serializer.validated_data.get("repository_version"):
-        return request.user.has_perm(permission, repo_ver.repository)
+        return request.user.has_perm(permission, repo_ver.repository.cast())
     return True
 
 

@@ -2,6 +2,7 @@ from .base import (
     AsyncCreateMixin,
     AsyncRemoveMixin,
     AsyncUpdateMixin,
+    LabelsMixin,
     NamedModelViewSet,
     RolesMixin,
     NAME_FILTER_OPTIONS,
@@ -22,7 +23,7 @@ from .content import (
     SigningServiceViewSet,
 )
 from .custom_filters import (
-    RepoVersionHrefFilter,
+    RepoVersionHrefPrnFilter,
     RepositoryVersionFilter,
 )
 from .domain import DomainViewSet
@@ -52,7 +53,9 @@ from .publication import (
     PublicationFilter,
     PublicationViewSet,
     RBACContentGuardViewSet,
+    CompositeContentGuardViewSet,
     ContentRedirectContentGuardViewSet,
+    HeaderContentGuardViewSet,
     ArtifactDistributionViewSet,
 )
 from .reclaim import ReclaimSpaceViewSet
@@ -73,8 +76,18 @@ from .user import (
     GroupViewSet,
     GroupRoleViewSet,
     GroupUserViewSet,
+    LoginViewSet,
     RoleViewSet,
     UserViewSet,
     UserRoleViewSet,
 )
 from .replica import UpstreamPulpViewSet
+from .openpgp import (
+    OpenPGPDistributionViewSet,
+    OpenPGPKeyringViewSet,
+    OpenPGPPublicKeyViewSet,
+    OpenPGPPublicSubkeyViewSet,
+    OpenPGPSignatureViewSet,
+    OpenPGPUserAttributeViewSet,
+    OpenPGPUserIDViewSet,
+)

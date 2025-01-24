@@ -1,10 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from gettext import gettext as _
 from logging import getLogger
 import asyncio
 import hashlib
 
-from aiohttp.client_exceptions import ClientResponseError
 from asgiref.sync import sync_to_async
 from django.db import transaction
 from rest_framework.serializers import ValidationError
@@ -68,7 +68,7 @@ async def _repair_ca(content_artifact, repaired=None):
             "Artifact {} is unrepairable - no remote source".format(content_artifact.artifact)
         )
         log.warning(
-            "Deleting file for the unreparable artifact {}".format(content_artifact.artifact)
+            "Deleting file for the unrepairable artifact {}".format(content_artifact.artifact)
         )
         await sync_to_async(content_artifact.artifact.file.delete)(save=False)
         return False
@@ -78,7 +78,7 @@ async def _repair_ca(content_artifact, repaired=None):
         downloader = detail_remote.get_downloader(remote_artifact)
         try:
             dl_result = await downloader.run()
-        except ClientResponseError as e:
+        except Exception as e:
             log.warn(_("Redownload failed from '{}': {}.").format(remote_artifact.url, str(e)))
         else:
             if dl_result.artifact_attributes["sha256"] == content_artifact.artifact.sha256:
@@ -91,12 +91,14 @@ async def _repair_ca(content_artifact, repaired=None):
                 if repaired is not None:
                     await repaired.aincrement()
                 return True
-    log.warning("Deleting file for the unreparable artifact {}".format(content_artifact.artifact))
+    log.warning("Deleting file for the unrepairable artifact {}".format(content_artifact.artifact))
     await sync_to_async(content_artifact.artifact.file.delete)(save=False)
     return False
 
 
 def _verify_artifact(artifact):
+    domain = get_domain()
+    assert domain.pk == artifact.pulp_domain_id
     try:
         # verify files digest
         hasher = hashlib.sha256()
@@ -130,7 +132,7 @@ async def _repair_artifacts_for_content(subset=None, verify_checksums=True):
     ) as repaired:
         with ThreadPoolExecutor(max_workers=2) as checksum_executor:
             storage = domain.get_storage()
-            async for content_artifact in (query_set.select_related("artifact").aiterator()):
+            async for content_artifact in query_set.select_related("artifact").aiterator():
                 artifact = content_artifact.artifact
 
                 valid = await loop.run_in_executor(None, storage.exists, artifact.file.name)
@@ -145,7 +147,7 @@ async def _repair_artifacts_for_content(subset=None, verify_checksums=True):
                     # Should stay in (an) executor so that at least it doesn't completely block
                     # downloads.
                     valid = await loop.run_in_executor(
-                        checksum_executor, _verify_artifact, artifact
+                        checksum_executor, copy_context().run, _verify_artifact, artifact
                     )
                     if not valid:
                         await corrupted.aincrement()
@@ -210,9 +212,9 @@ def add_and_remove(repository_pk, add_content_units, remove_content_units, base_
     Args:
         repository_pk (uuid): The primary key for a Repository for which a new Repository Version
             should be created.
-        add_content_units (list): List of PKs for :class:`~pulpcore.app.models.Content` that
+        add_content_units (list): List of PKs for [pulpcore.app.models.Content][] that
             should be added to the previous Repository Version for this Repository.
-        remove_content_units (list): List of PKs for:class:`~pulpcore.app.models.Content` that
+        remove_content_units (list): List of PKs for[pulpcore.app.models.Content][] that
             should be removed from the previous Repository Version for this Repository.
         base_version_pk (uuid): the primary key for a RepositoryVersion whose content will be used
             as the initial set of content for our new RepositoryVersion

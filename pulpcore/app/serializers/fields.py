@@ -4,13 +4,14 @@ from gettext import gettext as _
 from urllib.parse import urljoin
 
 from django.conf import settings
+from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.types import OpenApiTypes
 from rest_framework import serializers
 from rest_framework.fields import empty
-from rest_framework.reverse import reverse
 
 from pulpcore.app import models
 from pulpcore.app.serializers import DetailIdentityField, IdentityField, RelatedField
-from pulpcore.app.util import get_domain
+from pulpcore.app.util import reverse
 
 
 def relative_path_validator(relative_path):
@@ -18,6 +19,50 @@ def relative_path_validator(relative_path):
         raise serializers.ValidationError(
             _("Relative path can't start with '/'. {0}").format(relative_path)
         )
+
+
+# Prefer JSONDictField and JSONListField over JSONField:
+# * Drf serializers.JSONField provides a OpenApi schema type of Any.
+# * This can cause problems with bindings and is not helpful to the user.
+# * https://github.com/tfranzel/drf-spectacular/issues/1095
+
+
+@extend_schema_field(OpenApiTypes.OBJECT)
+class JSONDictField(serializers.JSONField):
+    """A JSONField accepting dicts, specifying as type 'object' in the openapi."""
+
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        ERROR_MSG = f"Invalid type. Expected a JSON object (dict), got {value!r}."
+        # This condition is from the JSONField source:
+        # if it's True, it will return the python representation,
+        # else the raw data string
+        returns_python_repr = self.binary or getattr(data, "is_json_string", False)
+        if returns_python_repr:
+            if not isinstance(value, dict):
+                raise serializers.ValidationError(ERROR_MSG)
+        elif not value.strip().startswith("{"):
+            raise serializers.ValidationError(ERROR_MSG)
+        return value
+
+
+@extend_schema_field(serializers.ListField)
+class JSONListField(serializers.JSONField):
+    """A JSONField accepting lists, specifying as type 'array' in the openapi."""
+
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        ERROR_MSG = f"Invalid type. Expected a JSON array (list), got {value!r}."
+        # This condition is from the JSONField source:
+        # if it's True, it will return the python representation,
+        # else the raw data string
+        returns_python_repr = self.binary or getattr(data, "is_json_string", False)
+        if returns_python_repr:
+            if not isinstance(value, list):
+                raise serializers.ValidationError(ERROR_MSG)
+        elif not value.strip().startswith("["):
+            raise serializers.ValidationError(ERROR_MSG)
+        return value
 
 
 class SingleContentArtifactField(RelatedField):
@@ -39,7 +84,7 @@ class SingleContentArtifactField(RelatedField):
         improper context.
 
         Args:
-            instance (:class:`pulpcore.app.models.Content`): An instance of Content being
+            instance (pulpcore.app.models.Content) An instance of Content being
                 serialized.
 
         Returns:
@@ -77,14 +122,14 @@ class ContentArtifactChecksumField(serializers.CharField):
         This serializer looks up the checksum for single artifact content
 
         Args:
-            instance (:class:`pulpcore.app.models.Content`): An instance of Content being
+            instance (pulpcore.app.models.Content) An instance of Content being
                 serialized.
 
         Returns:
             A string of the checksum or None.
 
         Raises:
-            :class:`rest_framework.exceptions.ValidationError`: When more than one Artifacts exist.
+            [rest_framework.exceptions.ValidationError][]: When more than one Artifacts exist.
         """
         # using get() and first() will query the db. count() and all() will use cached artifacts if
         # they are prefetched.
@@ -122,7 +167,7 @@ class ContentArtifactsField(serializers.DictField):
                 instances.
 
         Raises:
-            :class:`rest_framework.exceptions.ValidationError`: When one of the Artifacts does not
+            [rest_framework.exceptions.ValidationError][]: When one of the Artifacts does not
                 exist or one of the paths is not a relative path or the field is missing.
         """
         ret = {}
@@ -154,7 +199,7 @@ class ContentArtifactsField(serializers.DictField):
         ContentArtifact models related to this Content.
 
         Args:
-            instance (:class:`pulpcore.app.models.Content`): An instance of Content being
+            instance (pulpcore.app.models.Content) An instance of Content being
                 serialized.
 
         Returns:
@@ -170,7 +215,7 @@ class ContentArtifactsField(serializers.DictField):
         URLs.
 
         Args:
-            value (list of :class:`pulpcore.app.models.ContentArtifact`): A list of all the
+            value (list of [pulpcore.app.models.ContentArtifact][]): A list of all the
                 ContentArtifacts related to the Content model being serialized.
 
         Returns:
@@ -179,13 +224,11 @@ class ContentArtifactsField(serializers.DictField):
         """
         ret = {}
         kwargs = {}
-        if settings.DOMAIN_ENABLED:
-            domain = get_domain()
-            kwargs["pulp_domain"] = domain.name
         for content_artifact in value:
             if content_artifact.artifact_id:
                 kwargs["pk"] = content_artifact.artifact_id
-                url = reverse("artifacts-detail", kwargs=kwargs, request=None)
+                request = self.context.get("request")
+                url = reverse("artifacts-detail", kwargs=kwargs, request=request)
             else:
                 url = None
             ret[content_artifact.relative_path] = url
@@ -252,7 +295,7 @@ class LatestVersionField(RepositoryVersionRelatedField):
                 current ViewSet.
 
         Returns:
-            instance :class:`pulpcore.app.models.RepositoryVersion`
+            instance [pulpcore.app.models.RepositoryVersion][]
         """
         if hasattr(instance, "latest_version_number"):
             # Return a shallow object sufficient to create the HREF.

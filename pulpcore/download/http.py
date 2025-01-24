@@ -71,10 +71,6 @@ class HttpDownloader(BaseDownloader):
     allow for an active download to be arbitrarily long, while still detecting dead or closed
     sessions even when TCPKeepAlive is disabled.
 
-    If a session is not provided, the one created will force TCP connection closure after each
-    request. This is done for compatibility reasons due to various issues related to session
-    continuation implementation in various servers.
-
     `aiohttp.ClientSession` objects allows you to configure options that will apply to all
     downloaders using that session such as auth, timeouts, headers, etc. For more info on these
     options see the `aiohttp.ClientSession` docs for more information:
@@ -125,7 +121,7 @@ class HttpDownloader(BaseDownloader):
             as its values. e.g. `{'Transfer-Encoding': 'chunked'}`. This can also be None.
 
     This downloader also has all of the attributes of
-    :class:`~pulpcore.plugin.download.BaseDownloader`
+    [pulpcore.plugin.download.BaseDownloader][]
     """
 
     def __init__(
@@ -158,14 +154,14 @@ class HttpDownloader(BaseDownloader):
             throttler (asyncio_throttle.Throttler): Throttler for asyncio.
             max_retries (int): The maximum number of times to retry a download upon failure.
             kwargs (dict): This accepts the parameters of
-                :class:`~pulpcore.plugin.download.BaseDownloader`.
+                [pulpcore.plugin.download.BaseDownloader][].
         """
         if session:
             self.session = session
             self._close_session_on_finalize = False
         else:
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=600, sock_read=600)
-            conn = aiohttp.TCPConnector({"force_close": True})
+            conn = aiohttp.TCPConnector()
             self.session = aiohttp.ClientSession(
                 connector=conn, timeout=timeout, headers=headers, requote_redirect_url=False
             )
@@ -218,20 +214,22 @@ class HttpDownloader(BaseDownloader):
 
     async def run(self, extra_data=None):
         """
-        Run the downloader with concurrency restriction and retry logic.
+        Run the downloader with concurrency restriction and optional retry logic.
 
         This method acquires `self.semaphore` before calling the actual download implementation
         contained in `_run()`. This ensures that the semaphore stays acquired even as the `backoff`
         wrapper around `_run()`, handles backoff-and-retry logic.
 
         Args:
-            extra_data (dict): Extra data passed to the downloader.
+            extra_data (dict): Extra data passed to the downloader:
+                disable_retry_list: List of exceptions which should not be retried.
 
         Returns:
-            :class:`~pulpcore.plugin.download.DownloadResult` from `_run()`.
+            [pulpcore.plugin.download.DownloadResult][] from `_run()`.
 
         """
-        retryable_errors = (
+        disable_retry_list = [] if not extra_data else extra_data.get("disable_retry_list", [])
+        default_retryable_errors = (
             aiohttp.ClientConnectorSSLError,
             aiohttp.ClientConnectorError,
             aiohttp.ClientOSError,
@@ -244,6 +242,9 @@ class HttpDownloader(BaseDownloader):
             SizeValidationError,
         )
 
+        retryable_errors = tuple(
+            [e for e in default_retryable_errors if e not in disable_retry_list]
+        )
         async with self.semaphore:
 
             @backoff.on_exception(

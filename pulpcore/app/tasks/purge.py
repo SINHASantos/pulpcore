@@ -1,15 +1,17 @@
 from gettext import gettext as _
 from logging import getLogger
 
+from django.conf import settings
 from django.db.models.deletion import ProtectedError
+from django.utils import timezone
 
 from pulpcore.app.models import (
     ProgressReport,
     Task,
 )
 from pulpcore.app.role_util import get_objects_for_user
-from pulpcore.app.util import get_domain, get_current_authenticated_user
-from pulpcore.constants import TASK_STATES
+from pulpcore.app.util import current_task, get_domain, get_current_authenticated_user
+from pulpcore.constants import TASK_STATES, TASK_FINAL_STATES
 
 log = getLogger(__name__)
 
@@ -55,13 +57,14 @@ def _details_reporting(current_reports, current_details, totals_pb):
     return current_reports
 
 
-def purge(finished_before, states):
+def purge(finished_before=None, states=None):
     """
     This task purges from the database records of tasks which finished prior to the specified time.
 
-    It will remove only tasks that are 'owned' by the current-user (admin-users own All The Things,
-    so admins can delete all tasks). It will only delete tasks within the domain this task was
-    triggered in.
+    It will remove only tasks that are 'deletable' by the current-user (admin-users own All The
+    Things, so admins can delete all tasks). It will only delete tasks within the domain this task
+    was triggered in.
+    If scheduled, deletion is not limited to a user.
 
     It will not remove tasks that are incomplete (ie, in states running|waiting|cancelling).
 
@@ -70,18 +73,30 @@ def purge(finished_before, states):
     by deleting a Task.
 
     Args:
-        finished_before (DateTime): Earliest finished-time to **NOT** purge.
-        states (List[str]): List of task-states we want to purge.
+        finished_before (Optional[DateTime]): Earliest finished-time to **NOT** purge.
+        states (Optional[List[str]]): List of task-states we want to purge.
 
     """
-    current_user = get_current_authenticated_user()
+    if finished_before is None:
+        assert settings.TASK_PROTECTION_TIME > 0
+        finished_before = timezone.now() - timezone.timedelta(minutes=settings.TASK_PROTECTION_TIME)
+    if states is None:
+        states = TASK_FINAL_STATES
     domain = get_domain()
     # Tasks, prior to the specified date, in the specified state, owned by the current-user, in the
     # current domain
-    tasks_qs = Task.objects.filter(
+    candidate_qs = Task.objects.filter(
         finished_at__lt=finished_before, state__in=states, pulp_domain=domain
     )
-    candidate_qs = get_objects_for_user(current_user, "core.delete_task", qs=tasks_qs)
+    # Has this task not been dispatched from a task schedule? Then we assume there was a user doing
+    # that.
+    if not current_task.get().taskschedule_set.exists():
+        current_user = get_current_authenticated_user()
+        assert current_user is not None, (
+            "This task should have been dispatched by a user. Cannot find it though. "
+            "Maybe it got deleted."
+        )
+        candidate_qs = get_objects_for_user(current_user, "core.delete_task", qs=candidate_qs)
     # Progress bar reporting total-units
     totals_pb = ProgressReport(
         message=_("Purged task-related-objects total"),
@@ -143,7 +158,7 @@ def purge(finished_before, states):
                     # Log the details of the object.
                     error_pb.done += 1
                     pks_failed.append(pk)
-                    log.info(e)
+                    log.debug(e)
 
     # Complete the progress-reports for the specific entities deleted
     for key, pb in details_reports.items():

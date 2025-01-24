@@ -2,8 +2,6 @@ import os
 
 from gettext import gettext as _
 
-from aiohttp.client_exceptions import ClientResponseError
-
 from django.conf import settings
 from django.core.management import BaseCommand, CommandError
 from django.db.models import Q, Sum
@@ -73,9 +71,7 @@ class Command(BaseCommand):
         )
         if content.count():
             self.stdout.write(
-                "There is approx {:.2f}Mb of content to be downloaded.".format(
-                    ras_size / (1024**2)
-                )
+                "There is approx {:.2f}Mb of content to be downloaded.".format(ras_size / (1024**2))
             )
 
         if repo_versions.exists():
@@ -126,7 +122,7 @@ class Command(BaseCommand):
                         downloader = remote.get_downloader(ra)
                         try:
                             dl_result = downloader.fetch()
-                        except ClientResponseError as e:
+                        except Exception as e:
                             self.stdout.write(
                                 _("Redownload failed from '{}': {}.").format(ra.url, str(e))
                             )
@@ -139,8 +135,9 @@ class Command(BaseCommand):
                                 setattr(artifact, checksum, dl_result.artifact_attributes[checksum])
                                 restored = True
                                 break
-                self.stdout.write(_("Deleting unreparable file {}".format(file_path)))
-                artifact.file.delete(save=False)
+                if not restored:
+                    self.stdout.write(_("Deleting unrepairable file {}".format(file_path)))
+                    artifact.file.delete(save=False)
             else:
                 break
         return restored

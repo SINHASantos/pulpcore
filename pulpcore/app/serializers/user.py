@@ -3,6 +3,7 @@ import typing
 from gettext import gettext as _
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth import login as auth_login
 from django.contrib.auth.models import Permission
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
@@ -20,6 +21,7 @@ from pulpcore.app.serializers import (
     ModelSerializer,
     HiddenFieldsMixin,
     RelatedField,
+    PRNField,
 )
 from pulpcore.app.util import (
     get_viewset_for_model,
@@ -86,16 +88,18 @@ class UserGroupSerializer(serializers.ModelSerializer):
 
     name = serializers.CharField(help_text=_("Name."), max_length=150)
     pulp_href = IdentityField(view_name="groups-detail")
+    prn = PRNField()
 
     class Meta:
         model = Group
-        fields = ("name", "pulp_href")
+        fields = ("name", "pulp_href", "prn")
 
 
 class UserSerializer(serializers.ModelSerializer, HiddenFieldsMixin):
     """Serializer for User."""
 
     pulp_href = IdentityField(view_name="users-detail")
+    prn = PRNField()
     id = serializers.IntegerField(read_only=True)
     username = serializers.CharField(
         help_text=_("Required. 150 characters or fewer. Letters, digits and @/./+/-/_ only."),
@@ -138,6 +142,7 @@ class UserSerializer(serializers.ModelSerializer, HiddenFieldsMixin):
         model = User
         fields = (
             "pulp_href",
+            "prn",
             "id",
             "username",
             "password",
@@ -160,10 +165,11 @@ class GroupUserSerializer(ValidateFieldsMixin, serializers.ModelSerializer):
         max_length=150,
     )
     pulp_href = IdentityField(view_name="users-detail")
+    prn = PRNField()
 
     class Meta:
         model = User
-        fields = ("username", "pulp_href")
+        fields = ("username", "pulp_href", "prn")
 
 
 class GroupSerializer(ValidateFieldsMixin, serializers.ModelSerializer):
@@ -176,10 +182,11 @@ class GroupSerializer(ValidateFieldsMixin, serializers.ModelSerializer):
         max_length=150,
         validators=[UniqueValidator(queryset=Group.objects.all())],
     )
+    prn = PRNField()
 
     class Meta:
         model = Group
-        fields = ("name", "pulp_href", "id")
+        fields = ("name", "pulp_href", "prn", "id")
 
 
 class RoleSerializer(ModelSerializer):
@@ -484,3 +491,14 @@ class NestedRoleSerializer(serializers.Serializer):
                         )
                     self.group_role_pks.append(qs.get().pk)
         return data
+
+
+class LoginSerializer(serializers.Serializer):
+    pulp_href = IdentityField(view_name="users-detail")
+    prn = PRNField()
+    username = serializers.CharField(read_only=True)
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        auth_login(self.context["request"], user)
+        return user

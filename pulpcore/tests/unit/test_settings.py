@@ -2,14 +2,6 @@ import pytest
 from dynaconf.validator import ValidationError
 
 
-def test_content_origin(settings):
-    """Test validation error is raised when CONTENT_ORIGIN is missing."""
-    # force needs to be True in order to remove CONTENT_ORIGIN since keep makes it a default
-    settings.unset("CONTENT_ORIGIN", force=True)
-    with pytest.raises(ValidationError):
-        settings.validators.validate()
-
-
 def test_cache_enabled(settings):
     """Test that when CACHE_ENABLED is set REDIS_URL or REDIS_HOST & REDIS_PORT."""
     settings.set("CACHE_ENABLED", True)
@@ -50,5 +42,16 @@ def test_api_root(settings):
         settings.validators.validate()
 
     settings.set("API_ROOT", "hi/there/")
+    with pytest.raises(ValidationError):
+        settings.validators.validate()
+
+
+def test_json_header_authentication(settings):
+    settings.set("AUTHENTICATION_BACKENDS", "django.contrib.auth.backends.RemoteUserBackend")
+    settings.set(
+        "REST_FRAMEWORK__DEFAULT_AUTHENTICATION_CLASSES",
+        "pulpcore.app.authentication.JSONHeaderRemoteAuthentication",
+    )
+    settings.set("AUTHENTICATION_JSON_HEADER", "SOMETHING")
     with pytest.raises(ValidationError):
         settings.validators.validate()

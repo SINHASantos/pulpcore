@@ -3,14 +3,18 @@ import logging
 from multidict import CIMultiDict
 import os
 import re
+import socket
+import struct
 from gettext import gettext as _
+from datetime import timedelta
 
-from aiohttp.client_exceptions import ClientResponseError
+from aiohttp.client_exceptions import ClientResponseError, ClientConnectionError
 from aiohttp.web import FileResponse, StreamResponse, HTTPOk
 from aiohttp.web_exceptions import (
     HTTPError,
     HTTPForbidden,
     HTTPFound,
+    HTTPMovedPermanently,
     HTTPNotFound,
     HTTPRequestRangeNotSatisfiable,
 )
@@ -19,7 +23,9 @@ from yarl import URL
 from asgiref.sync import sync_to_async
 
 import django
+from django.utils import timezone
 
+from pulpcore.constants import STORAGE_RESPONSE_MAP
 from pulpcore.responses import ArtifactResponse
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pulpcore.app.settings")
@@ -47,9 +53,16 @@ from pulpcore.app.models import (  # noqa: E402: module level not at top of file
     RemoteArtifact,
 )
 from pulpcore.app import mime_types  # noqa: E402: module level not at top of file
-from pulpcore.app.util import get_domain, cache_key  # noqa: E402: module level not at top of file
+from pulpcore.app.util import (  # noqa: E402: module level not at top of file
+    get_domain,
+    cache_key,
+)
 
-from pulpcore.exceptions import UnsupportedDigestValidationError  # noqa: E402
+from pulpcore.exceptions import (  # noqa: E402
+    UnsupportedDigestValidationError,
+    DigestValidationError,
+)
+from pulpcore.metrics import artifacts_size_counter  # noqa: E402
 
 from jinja2 import Template  # noqa: E402: module level not at top of file
 from pulpcore.cache import AsyncContentCache  # noqa: E402
@@ -164,13 +177,16 @@ class Handler:
         The handler for an HTML listing all distributions
 
         Args:
-            request (:class:`aiohttp.web.request`): The request from the client.
+            request (aiohttp.web.request) The request from the client.
 
         Raises:
-            :class:`aiohttp.web.HTTPOk`: The response back to the client.
-            :class: `PathNotResolved`: 404 error response when path doesn't exist.
+            [aiohttp.web.HTTPOk][]: The response back to the client.
+            [PathNotResolved][]: 404 error response when path doesn't exist.
         """
         domain = get_domain()
+
+        if not request.path.endswith("/"):
+            raise HTTPMovedPermanently(f"{request.path}/")
 
         def get_base_paths_blocking():
             distro_model = self.distribution_model or Distribution
@@ -186,8 +202,8 @@ class Handler:
         Finds the base-path to use for the base-key in the cache
 
         Args:
-            request (:class:`aiohttp.web.request`): The request from the client.
-            cached (:class:`CacheAiohttp`): The Pulp cache
+            request (aiohttp.web.request) The request from the client.
+            cached (CacheAiohttp) The Pulp cache
 
         Returns:
             str: The base-path associated with this request
@@ -202,7 +218,9 @@ class Handler:
         if index_p1:
             return cache_key(base_paths[index_p1 - 1])
         else:
-            distro = await sync_to_async(cls._match_distribution)(path)
+            distro = await sync_to_async(cls._match_distribution)(
+                path, add_trailing_slash=cached.ADD_TRAILING_SLASH
+            )
             return cache_key(distro.base_path)
 
     @classmethod
@@ -211,15 +229,17 @@ class Handler:
         Authentication check for the cached stream_content handler
 
         Args:
-            request (:class:`aiohttp.web.request`): The request from the client.
-            cached (:class:`CacheAiohttp`): The Pulp cache
+            request (aiohttp.web.request) The request from the client.
+            cached (CacheAiohttp) The Pulp cache
             base_key (str): The base_key associated with this response
         """
         guard_key = "DISTRO#GUARD#PRESENT"
         present = await cached.get(guard_key, base_key=base_key)
         if present == b"True" or present is None:
             path = request.match_info["path"]
-            distro = await sync_to_async(cls._match_distribution)(path)
+            distro = await sync_to_async(cls._match_distribution)(
+                path, add_trailing_slash=cached.ADD_TRAILING_SLASH
+            )
             try:
                 guard = await sync_to_async(cls._permit)(request, distro)
             except HTTPForbidden:
@@ -238,10 +258,10 @@ class Handler:
         The request handler for the Content app.
 
         Args:
-            request (:class:`aiohttp.web.request`): The request from the client.
+            request (aiohttp.web.request) The request from the client.
 
         Returns:
-            :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
+            [aiohttp.web.StreamResponse][] or [aiohttp.web.FileResponse][]: The response
                 back to the client.
         """
         path = request.match_info["path"]
@@ -269,12 +289,13 @@ class Handler:
         return tree
 
     @classmethod
-    def _match_distribution(cls, path):
+    def _match_distribution(cls, path, add_trailing_slash=True):
         """
         Match a distribution using a list of base paths and return its detail object.
 
         Args:
             path (str): The path component of the URL.
+            add_trailing_slash (bool): If true, a missing trailing '/' will be appended to the path.
 
         Returns:
             The detail object of the matched distribution.
@@ -283,6 +304,10 @@ class Handler:
             DistroListings: when multiple matches are possible.
             PathNotResolved: when not matched.
         """
+        original_path = path
+        path_ends_in_slash = path.endswith("/")
+        if not path_ends_in_slash and add_trailing_slash:
+            path = f"{path}/"
         base_paths = cls._base_paths(path)
         distro_model = cls.distribution_model or Distribution
         domain = get_domain()
@@ -307,15 +332,24 @@ class Handler:
                     pulp_domain=domain, base_path__startswith=path
                 )
                 if distros.count():
-                    raise DistroListings(path=path, distros=distros)
+                    if path_ends_in_slash:
+                        raise DistroListings(path=path, distros=distros)
+                    else:
+                        # The list of a subset of distributions was requested without a trailing /
+                        if settings.DOMAIN_ENABLED:
+                            raise HTTPMovedPermanently(
+                                f"{settings.CONTENT_PATH_PREFIX}{domain.name}/{path}"
+                            )
+                        else:
+                            raise HTTPMovedPermanently(f"{settings.CONTENT_PATH_PREFIX}{path}")
 
             log.debug(
                 _("Distribution not matched for {path} using: {base_paths}").format(
-                    path=path, base_paths=base_paths
+                    path=original_path, base_paths=base_paths
                 )
             )
 
-        raise PathNotResolved(path)
+        raise PathNotResolved(original_path)
 
     @staticmethod
     def _permit(request, distribution):
@@ -325,12 +359,12 @@ class Handler:
         Authorization is delegated to the optional content-guard associated with the distribution.
 
         Args:
-            request (:class:`aiohttp.web.Request`): A request for a published file.
-            distribution (detail of :class:`pulpcore.plugin.models.Distribution`): The matched
+            request (aiohttp.web.Request) A request for a published file.
+            distribution (detail of [pulpcore.plugin.models.Distribution][]): The matched
                 distribution.
 
         Raises:
-            :class:`aiohttp.web_exceptions.HTTPForbidden`: When not permitted.
+            [aiohttp.web_exceptions.HTTPForbidden][]: When not permitted.
         """
         guard = distribution.content_guard
         if not guard:
@@ -384,6 +418,9 @@ class Handler:
         """
         dates = dates or {}
         sizes = sizes or {}
+        root = path == settings.CONTENT_PATH_PREFIX
+        if root and settings.DOMAIN_ENABLED:
+            path += f"{get_domain().name}/"
         template = Template(
             """
 <html>
@@ -398,7 +435,7 @@ class Handler:
 {% else -%}
 {% set date = "" -%}
 {% endif -%}
-{% if sizes.get(name, "") -%}
+{% if name in sizes -%}
 {% set size | filesizeformat -%}
 {{ sizes.get(name) }}
 {% endset -%}
@@ -416,7 +453,7 @@ class Handler:
             dir_list=sorted(directory_list),
             dates=dates,
             path=path,
-            root=path == settings.CONTENT_PATH_PREFIX,
+            root=root,
             sizes=sizes,
         )
 
@@ -429,8 +466,8 @@ class Handler:
         version or publication.
 
         Args:
-            repo_version (:class:`~pulpcore.app.models.RepositoryVersion`): The repository version
-            publication (:class:`~pulpcore.app.models.Publication`): Publication
+            repo_version (pulpcore.app.models.RepositoryVersion) The repository version
+            publication (pulpcore.app.models.Publication) Publication
             path (str): relative path inside the repo version of publication.
 
         Returns:
@@ -492,13 +529,11 @@ class Handler:
                 )
                 # Find the sizes for on_demand artifacts
                 r_artifacts = RemoteArtifact.objects.filter(
-                    content_artifact__in=artifacts_to_find.keys()
+                    content_artifact__in=artifacts_to_find.keys(), size__isnull=False
                 ).values_list("content_artifact_id", "size")
                 sizes.update({artifacts_to_find[ra_ca_id]: size for ra_ca_id, size in r_artifacts})
 
-                return directory_list, dates, sizes
-            else:
-                raise PathNotResolved(path)
+            return directory_list, dates, sizes
 
         return await sync_to_async(list_directory_blocking)()
 
@@ -525,14 +560,14 @@ class Handler:
 
         Args:
             path (str): The path component of the URL.
-            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            request(aiohttp.web.Request) The request to prepare a response for.
 
         Raises:
             PathNotResolved: The path could not be matched to a published file.
             PermissionError: When not permitted.
 
         Returns:
-            :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
+            [aiohttp.web.StreamResponse][] or [aiohttp.web.FileResponse][]: The response
                 streamed back to the client.
         """
         distro = await sync_to_async(self._match_distribution)(path)
@@ -543,11 +578,31 @@ class Handler:
         rel_path = rel_path[len(distro.base_path) :]
         rel_path = rel_path.lstrip("/")
 
-        content_handler_result = await sync_to_async(distro.content_handler)(rel_path)
-        if content_handler_result is not None:
-            return content_handler_result
+        if rel_path == "" and not path.endswith("/"):
+            # The root of a distribution base_path was requested without a slash
+            raise HTTPMovedPermanently(f"{request.path}/")
 
-        headers = self.response_headers(rel_path, distro)
+        original_rel_path = rel_path
+        ends_in_slash = rel_path == "" or rel_path.endswith("/")
+        if not ends_in_slash:
+            rel_path = f"{rel_path}/"
+
+        headers = self.response_headers(original_rel_path, distro)
+
+        content_handler_result = await sync_to_async(distro.content_handler)(original_rel_path)
+        if content_handler_result is not None:
+            if isinstance(content_handler_result, ContentArtifact):
+                if content_handler_result.artifact:
+                    return await self._serve_content_artifact(
+                        content_handler_result, headers, request
+                    )
+                else:
+                    return await self._stream_content_artifact(
+                        request, StreamResponse(headers=headers), content_handler_result
+                    )
+            else:
+                # the result is a response so just return it
+                return content_handler_result
 
         repository = distro.repository
         publication = distro.publication
@@ -572,19 +627,24 @@ class Handler:
                 repo_version = await repository.alatest_version()
 
         if publication:
-            if rel_path == "" or rel_path[-1] == "/":
-                try:
-                    index_path = "{}index.html".format(rel_path)
+            try:
+                index_path = "{}index.html".format(rel_path)
 
-                    await publication.published_artifact.aget(relative_path=index_path)
-
-                    rel_path = index_path
-                    headers = self.response_headers(rel_path, distro)
-                except ObjectDoesNotExist:
-                    dir_list, dates, sizes = await self.list_directory(None, publication, rel_path)
-                    dir_list.update(
-                        await sync_to_async(distro.content_handler_list_directory)(rel_path)
-                    )
+                await publication.published_artifact.aget(relative_path=index_path)
+                if not ends_in_slash:
+                    # index.html found, but user didn't specify a trailing slash
+                    raise HTTPMovedPermanently(f"{request.path}/")
+                original_rel_path = index_path
+                headers = self.response_headers(original_rel_path, distro)
+            except ObjectDoesNotExist:
+                dir_list, dates, sizes = await self.list_directory(None, publication, rel_path)
+                dir_list.update(
+                    await sync_to_async(distro.content_handler_list_directory)(rel_path)
+                )
+                if dir_list and not ends_in_slash:
+                    # Directory can be listed, but user did not specify trailing slash
+                    raise HTTPMovedPermanently(f"{request.path}/")
+                elif dir_list:
                     return HTTPOk(
                         headers={"Content-Type": "text/html"},
                         body=self.render_html(
@@ -599,7 +659,7 @@ class Handler:
                         "content_artifact",
                         "content_artifact__artifact",
                         "content_artifact__artifact__pulp_domain",
-                    ).aget(relative_path=rel_path)
+                    ).aget(relative_path=original_rel_path)
                 ).content_artifact
 
             except ObjectDoesNotExist:
@@ -622,13 +682,13 @@ class Handler:
                         .filter(
                             content__in=publication.repository_version.content,
                         )
-                        .aget(relative_path=rel_path)
+                        .aget(relative_path=original_rel_path)
                     )
 
                 except MultipleObjectsReturned:
                     log.error(
                         "Multiple (pass-through) matches for {b}/{p}",
-                        {"b": distro.base_path, "p": rel_path},
+                        {"b": distro.base_path, "p": original_rel_path},
                     )
                     raise
                 except ObjectDoesNotExist:
@@ -642,19 +702,24 @@ class Handler:
                         )
 
         if repo_version and not publication and not distro.SERVE_FROM_PUBLICATION:
-            if rel_path == "" or rel_path[-1] == "/":
-                index_path = "{}index.html".format(rel_path)
+            # Look for index.html or list the directory
+            index_path = "{}index.html".format(rel_path)
 
-                contentartifact_exists = await ContentArtifact.objects.filter(
-                    content__in=repo_version.content, relative_path=index_path
-                ).aexists()
-                if contentartifact_exists:
-                    rel_path = index_path
-                else:
-                    dir_list, dates, sizes = await self.list_directory(repo_version, None, rel_path)
-                    dir_list.update(
-                        await sync_to_async(distro.content_handler_list_directory)(rel_path)
-                    )
+            contentartifact_exists = await ContentArtifact.objects.filter(
+                content__in=repo_version.content, relative_path=index_path
+            ).aexists()
+            if contentartifact_exists:
+                original_rel_path = index_path
+                headers = self.response_headers(original_rel_path, distro)
+            else:
+                dir_list, dates, sizes = await self.list_directory(repo_version, None, rel_path)
+                dir_list.update(
+                    await sync_to_async(distro.content_handler_list_directory)(rel_path)
+                )
+                if dir_list and not ends_in_slash:
+                    # Directory can be listed, but user did not specify trailing slash
+                    raise HTTPMovedPermanently(f"{request.path}/")
+                elif dir_list:
                     return HTTPOk(
                         headers={"Content-Type": "text/html"},
                         body=self.render_html(
@@ -665,12 +730,12 @@ class Handler:
             try:
                 ca = await ContentArtifact.objects.select_related(
                     "artifact", "artifact__pulp_domain"
-                ).aget(content__in=repo_version.content, relative_path=rel_path)
+                ).aget(content__in=repo_version.content, relative_path=original_rel_path)
 
             except MultipleObjectsReturned:
                 log.error(
                     "Multiple (pass-through) matches for {b}/{p}",
-                    {"b": distro.base_path, "p": rel_path},
+                    {"b": distro.base_path, "p": original_rel_path},
                 )
                 raise
             except ObjectDoesNotExist:
@@ -686,7 +751,7 @@ class Handler:
         # If we haven't found a match yet, try to use pull-through caching with remote
         if distro.remote:
             remote = await distro.remote.acast()
-            if url := remote.get_remote_artifact_url(rel_path, request=request):
+            if url := remote.get_remote_artifact_url(original_rel_path, request=request):
                 if (
                     ra := await RemoteArtifact.objects.select_related(
                         "content_artifact__artifact__pulp_domain", "remote"
@@ -704,8 +769,10 @@ class Handler:
                         )
                 else:
                     # Try to stream the RemoteArtifact and potentially save it as a new Content unit
-                    save_artifact = remote.get_remote_artifact_content_type(rel_path) is not None
-                    ca = ContentArtifact(relative_path=rel_path)
+                    save_artifact = (
+                        remote.get_remote_artifact_content_type(original_rel_path) is not None
+                    )
+                    ca = ContentArtifact(relative_path=original_rel_path)
                     ra = RemoteArtifact(remote=remote, url=url, content_artifact=ca)
                     try:
                         return await self._stream_remote_artifact(
@@ -738,33 +805,42 @@ class Handler:
         Stream and optionally save a ContentArtifact by requesting it using the associated remote.
 
         If a fatal download failure occurs while downloading and there are additional
-        :class:`~pulpcore.plugin.models.RemoteArtifact` objects associated with the
-        :class:`~pulpcore.plugin.models.ContentArtifact` they will also be tried. If all
-        :class:`~pulpcore.plugin.models.RemoteArtifact` downloads raise exceptions, an HTTP 502
+        [pulpcore.plugin.models.RemoteArtifact][] objects associated with the
+        [pulpcore.plugin.models.ContentArtifact][] they will also be tried. If all
+        [pulpcore.plugin.models.RemoteArtifact][] downloads raise exceptions, an HTTP 502
         error is returned to the client.
 
         Args:
-            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
-            response (:class:`~aiohttp.web.StreamResponse`): The response to stream data to.
-            content_artifact (:class:`~pulpcore.plugin.models.ContentArtifact`): The ContentArtifact
+            request(aiohttp.web.Request) The request to prepare a response for.
+            response (aiohttp.web.StreamResponse) The response to stream data to.
+            content_artifact (pulpcore.plugin.models.ContentArtifact) The ContentArtifact
                 to fetch and then stream back to the client
 
         Raises:
-            :class:`~aiohttp.web.HTTPNotFound` when no
-                :class:`~pulpcore.plugin.models.RemoteArtifact` objects associated with the
-                :class:`~pulpcore.plugin.models.ContentArtifact` returned the binary data needed for
+            [aiohttp.web.HTTPNotFound][] when no
+                [pulpcore.plugin.models.RemoteArtifact][] objects associated with the
+                [pulpcore.plugin.models.ContentArtifact][] returned the binary data needed for
                 the client.
         """
+        # We should only skip exceptions that happen before we receive any data
+        # and start streaming, as we can't rollback data if something happens after that.
+        SKIPPABLE_EXCEPTIONS = (
+            ClientResponseError,
+            UnsupportedDigestValidationError,
+            ClientConnectionError,
+        )
 
-        remote_artifacts = content_artifact.remoteartifact_set.select_related(
-            "remote"
-        ).order_by_acs()
+        protection_time = settings.REMOTE_CONTENT_FETCH_FAILURE_COOLDOWN
+        remote_artifacts = (
+            content_artifact.remoteartifact_set.select_related("remote")
+            .order_by_acs()
+            .exclude(failed_at__gte=timezone.now() - timedelta(seconds=protection_time))
+        )
         async for remote_artifact in remote_artifacts:
             try:
                 response = await self._stream_remote_artifact(request, response, remote_artifact)
                 return response
-
-            except (ClientResponseError, UnsupportedDigestValidationError) as e:
+            except SKIPPABLE_EXCEPTIONS as e:
                 log.warning(
                     "Could not download remote artifact at '{}': {}".format(
                         remote_artifact.url, str(e)
@@ -778,7 +854,7 @@ class Handler:
         """
         Create/Get an Artifact and associate it to a RemoteArtifact and/or ContentArtifact.
 
-        Create (or get if already existing) an :class:`~pulpcore.plugin.models.Artifact`
+        Create (or get if already existing) an [pulpcore.plugin.models.Artifact][]
         based on the `download_result` and associate it to the `content_artifact` of the given
         `remote_artifact`. Both the created artifact and the updated content_artifact are saved to
         the DB.  The `remote_artifact` is also saved for the pull-through caching use case.
@@ -787,16 +863,16 @@ class Handler:
         additional/different steps for saving.
 
         Args:
-            download_result (:class:`~pulpcore.plugin.download.DownloadResult`: The
+            download_result ([pulpcore.plugin.download.DownloadResult][]: The
                 DownloadResult for the downloaded artifact.
 
-            remote_artifact (:class:`~pulpcore.plugin.models.RemoteArtifact`): The
+            remote_artifact (pulpcore.plugin.models.RemoteArtifact) The
                 RemoteArtifact to associate the Artifact with.
 
-            request (:class:`aiohttp.web.Request`): The request.
+            request (aiohttp.web.Request) The request.
 
         Returns:
-            The associated :class:`~pulpcore.plugin.models.Artifact`.
+            The associated [pulpcore.plugin.models.Artifact][].
         """
         content_artifact = remote_artifact.content_artifact
         remote = remote_artifact.remote
@@ -882,24 +958,59 @@ class Handler:
         the file (filesystem) or a redirect (S3).
 
         Args:
-            content_artifact (:class:`pulpcore.app.models.ContentArtifact`): The Content Artifact to
+            content_artifact (pulpcore.app.models.ContentArtifact) The Content Artifact to
                 respond with.
             headers (dict): A dictionary of response headers.
-            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            request(aiohttp.web.Request) The request to prepare a response for.
 
         Raises:
-            :class:`aiohttp.web_exceptions.HTTPFound`: When we need to redirect to the file
+            [aiohttp.web_exceptions.HTTPFound][]: When we need to redirect to the file
             NotImplementedError: If file is stored in a file storage we can't handle
 
         Returns:
-            The :class:`aiohttp.web.FileResponse` for the file.
+            The [aiohttp.web.FileResponse][] for the file.
         """
+
+        def _set_params_from_headers(hdrs, storage_domain):
+            # Map standard-response-headers to storage-object-specific keys
+            params = {}
+            if storage_domain in STORAGE_RESPONSE_MAP:
+                for a_key in STORAGE_RESPONSE_MAP[storage_domain]:
+                    if hdrs.get(a_key, None):
+                        params[STORAGE_RESPONSE_MAP[storage_domain][a_key]] = hdrs[a_key]
+            return params
+
+        def _build_url(**kwargs):
+            filename = os.path.basename(content_artifact.relative_path)
+            content_disposition = f"attachment;filename={filename}"
+
+            headers["Content-Disposition"] = content_disposition
+            parameters = _set_params_from_headers(headers, domain.storage_class)
+            storage_url = storage.url(artifact_name, parameters=parameters, **kwargs)
+
+            return URL(storage_url, encoded=True)
+
         artifact_file = content_artifact.artifact.file
         artifact_name = artifact_file.name
-        filename = os.path.basename(content_artifact.relative_path)
-        content_disposition = f"attachment;filename={filename}"
         domain = get_domain()
         storage = domain.get_storage()
+
+        content_length = artifact_file.size
+
+        try:
+            range_start, range_stop = request.http_range.start, request.http_range.stop
+            if range_start or range_stop:
+                if range_stop and artifact_file.size and range_stop > artifact_file.size:
+                    start = 0 if range_start is None else range_start
+                    content_length = artifact_file.size - start
+                elif range_stop:
+                    content_length = range_stop - range_start
+        except ValueError:
+            size = artifact_file.size or "*"
+            raise HTTPRequestRangeNotSatisfiable(headers={"Content-Range": f"bytes */{size}"})
+
+        headers["X-PULP-ARTIFACT-SIZE"] = str(content_length)
+        artifacts_size_counter.add(content_length)
 
         if domain.storage_class == "pulpcore.app.models.storage.FileSystem":
             path = storage.path(artifact_name)
@@ -909,28 +1020,12 @@ class Handler:
         elif not domain.redirect_to_object_storage:
             return ArtifactResponse(content_artifact.artifact, headers=headers)
         elif domain.storage_class == "storages.backends.s3boto3.S3Boto3Storage":
-            parameters = {"ResponseContentDisposition": content_disposition}
-            if headers.get("Content-Type"):
-                parameters["ResponseContentType"] = headers.get("Content-Type")
-            url = URL(
-                artifact_file.storage.url(
-                    artifact_name, parameters=parameters, http_method=request.method
-                ),
-                encoded=True,
-            )
-            raise HTTPFound(url)
-        elif domain.storage_class == "storages.backends.azure_storage.AzureStorage":
-            parameters = {"content_disposition": content_disposition}
-            if headers.get("Content-Type"):
-                parameters["content_type"] = headers.get("Content-Type")
-            url = URL(artifact_file.storage.url(artifact_name, parameters=parameters), encoded=True)
-            raise HTTPFound(url)
-        elif domain.storage_class == "storages.backends.gcloud.GoogleCloudStorage":
-            parameters = {"response_disposition": content_disposition}
-            if headers.get("Content-Type"):
-                parameters["content_type"] = headers.get("Content-Type")
-            url = URL(artifact_file.storage.url(artifact_name, parameters=parameters), encoded=True)
-            raise HTTPFound(url)
+            raise HTTPFound(_build_url(http_method=request.method), headers=headers)
+        elif domain.storage_class in (
+            "storages.backends.azure_storage.AzureStorage",
+            "storages.backends.gcloud.GoogleCloudStorage",
+        ):
+            raise HTTPFound(_build_url(), headers=headers)
         else:
             raise NotImplementedError()
 
@@ -939,16 +1034,16 @@ class Handler:
         Stream and save a RemoteArtifact.
 
         Args:
-            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
-            response (:class:`~aiohttp.web.StreamResponse`): The response to stream data to.
-            remote_artifact (:class:`~pulpcore.plugin.models.RemoteArtifact`): The RemoteArtifact
+            request(aiohttp.web.Request) The request to prepare a response for.
+            response (aiohttp.web.StreamResponse) The response to stream data to.
+            remote_artifact (pulpcore.plugin.models.RemoteArtifact) The RemoteArtifact
                 to fetch and then stream back to the client
             save_artifact (bool): Override the save behavior on the streamed RemoteArtifact
 
         Raises:
-            :class:`~aiohttp.web.HTTPNotFound` when no
-                :class:`~pulpcore.plugin.models.RemoteArtifact` objects associated with the
-                :class:`~pulpcore.plugin.models.ContentArtifact` returned the binary data needed for
+            [aiohttp.web.HTTPNotFound][] when no
+                [pulpcore.plugin.models.RemoteArtifact][] objects associated with the
+                [pulpcore.plugin.models.ContentArtifact][] returned the binary data needed for
                 the client.
 
         """
@@ -1012,6 +1107,13 @@ class Handler:
 
         async def handle_data(data):
             nonlocal data_size_handled
+            # If we got here, and the response hasn't had "prepare()" called on it, it's due to
+            # some code-path (i.e., FileDownloader) that doesn't know/care about
+            # headers_ready_callback failing to invoke it.
+            # We're not going to do anything more with headers at this point, so it's safe to
+            # "backstop" the prepare() call here, so the write() will be allowed.
+            if not response.prepared:
+                await response.prepare(request)
             if range_start or range_stop:
                 start_byte_pos = 0
                 end_byte_pos = len(data)
@@ -1033,13 +1135,42 @@ class Handler:
                 await original_finalize()
 
         downloader = remote.get_downloader(
-            remote_artifact=remote_artifact, headers_ready_callback=handle_response_headers
+            remote_artifact=remote_artifact,
+            headers_ready_callback=handle_response_headers,
         )
         original_handle_data = downloader.handle_data
         downloader.handle_data = handle_data
         original_finalize = downloader.finalize
         downloader.finalize = finalize
-        download_result = await downloader.run()
+        try:
+            download_result = await downloader.run(
+                extra_data={"disable_retry_list": (DigestValidationError,)}
+            )
+        except DigestValidationError:
+            remote_artifact.failed_at = timezone.now()
+            await remote_artifact.asave()
+            await downloader.session.close()
+            close_tcp_connection(request.transport._sock)
+            REMOTE_CONTENT_FETCH_FAILURE_COOLDOWN = settings.REMOTE_CONTENT_FETCH_FAILURE_COOLDOWN
+            raise RuntimeError(
+                f"Pulp tried streaming {remote_artifact.url!r} to "
+                "the client, but it failed checksum validation.\n\n"
+                "We can't recover from wrong data already sent so we are:\n"
+                "- Forcing the connection to close.\n"
+                "- Marking this Remote to be ignored for "
+                f"{REMOTE_CONTENT_FETCH_FAILURE_COOLDOWN=}s.\n\n"
+                "If the Remote is known to be fixed, try resyncing the associated repository.\n"
+                "If the Remote is known to be permanently corrupted, try removing "
+                "affected Pulp Remote, adding a good one and resyncing.\n"
+                "If the problem persists, please contact the Pulp team."
+            )
+
+        if content_length := response.headers.get("Content-Length"):
+            response.headers["X-PULP-ARTIFACT-SIZE"] = content_length
+            artifacts_size_counter.add(content_length)
+        else:
+            response.headers["X-PULP-ARTIFACT-SIZE"] = str(size)
+            artifacts_size_counter.add(size)
 
         if save_artifact and remote.policy != Remote.STREAMED:
             await asyncio.shield(
@@ -1050,3 +1181,13 @@ class Handler:
         if response.status == 404:
             raise HTTPNotFound()
         return response
+
+
+def close_tcp_connection(sock):
+    """Configure socket to close TCP connection immediately."""
+    try:
+        l_onoff = 1
+        l_linger = 0  # 0 seconds timeout - immediate close
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", l_onoff, l_linger))
+    except (socket.error, OSError) as e:
+        log.warning(f"Error configuring socket for force close: {e}")

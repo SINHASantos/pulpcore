@@ -1,18 +1,37 @@
-from django.conf import settings
+import logging
+
 from django.db.models import Model
+from django.utils.dateparse import parse_datetime
 
 from pulp_glue.common.context import PulpContext
 from pulpcore.tasking.tasks import dispatch
-from pulpcore.app.tasks.base import general_update, general_create, general_delete
+from pulpcore.app.tasks.base import (
+    general_update,
+    general_create,
+    general_multi_delete,
+)
 from pulpcore.plugin.util import get_url, get_domain
+
+_logger = logging.getLogger(__name__)
 
 
 class ReplicaContext(PulpContext):
-    def prompt(self, *args, **kwargs):
-        pass
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.out_buf = ""
+        self.err_buf = ""
 
-    def echo(self, *args, **kwargs):
-        pass
+    def echo(self, message: str, nl: bool = True, err: bool = False) -> None:
+        if err:
+            self.err_buf += message
+            if nl:
+                _logger.warn("{}", self.err_buf)
+                self.err_buf = ""
+        else:
+            self.out_buf += message
+            if nl:
+                _logger.info("{}", self.out_buf)
+                self.out_buf = ""
 
 
 class Replicator:
@@ -28,18 +47,18 @@ class Replicator:
     app_label = None
     sync_task = None
 
-    def __init__(self, pulp_ctx, task_group):
+    def __init__(self, pulp_ctx, task_group, tls_settings, server):
         """
         :param pulp_ctx: PulpReplicaContext
         :param task_group: TaskGroup
+        :param ca_cert: str
         """
         self.pulp_ctx = pulp_ctx
         self.task_group = task_group
+        self.tls_settings = tls_settings
+        self.server = server
         self.domain = get_domain()
-        uri = "/api/v3/distributions/"
-        if settings.DOMAIN_ENABLED:
-            uri = f"/{self.domain.name}{uri}"
-        self.distros_uri = uri
+        self.distros_uris = [f"pdrn:{self.domain.pulp_id}:distributions"]
 
     @staticmethod
     def needs_update(fields_dict, model_instance):
@@ -56,9 +75,9 @@ class Replicator:
                 needs_update = True
         return needs_update
 
-    def upstream_distributions(self, labels=None):
-        if labels:
-            params = {"pulp_label_select": labels}
+    def upstream_distributions(self, q=None):
+        if q:
+            params = {"q": q}
         else:
             params = {}
         offset = 0
@@ -78,16 +97,20 @@ class Replicator:
         return {}
 
     def create_or_update_remote(self, upstream_distribution):
-        if not upstream_distribution["repository"] and not upstream_distribution["publication"]:
+        if not upstream_distribution.get("repository") and not upstream_distribution.get(
+            "publication"
+        ):
             return None
         url = self.url(upstream_distribution)
+        remote_fields_dict = {"url": url}
+        remote_fields_dict.update(self.tls_settings)
+        remote_fields_dict.update(self.remote_extra_fields(upstream_distribution))
+
         # Check if there is a remote pointing to this distribution
         try:
             remote = self.remote_model_cls.objects.get(
                 name=upstream_distribution["name"], pulp_domain=self.domain
             )
-            remote_fields_dict = self.remote_extra_fields(upstream_distribution)
-            remote_fields_dict["url"] = url
             needs_update = self.needs_update(remote_fields_dict, remote)
             if needs_update:
                 dispatch(
@@ -95,13 +118,11 @@ class Replicator:
                     task_group=self.task_group,
                     exclusive_resources=[remote],
                     args=(remote.pk, self.app_label, self.remote_serializer_name),
-                    kwargs={"data": remote_fields_dict},
+                    kwargs={"data": remote_fields_dict, "partial": True},
                 )
         except self.remote_model_cls.DoesNotExist:
             # Create the remote
-            remote = self.remote_model_cls(name=upstream_distribution["name"], url=url)
-            for field_name, value in self.remote_extra_fields(upstream_distribution).items():
-                setattr(remote, field_name, value)
+            remote = self.remote_model_cls(name=upstream_distribution["name"], **remote_fields_dict)
             remote.save()
 
         return remote
@@ -122,7 +143,7 @@ class Replicator:
                     task_group=self.task_group,
                     exclusive_resources=[repository],
                     args=(repository.pk, self.app_label, self.repository_serializer_name),
-                    kwargs={"data": repo_fields_dict},
+                    kwargs={"data": repo_fields_dict, "partial": True},
                 )
         except self.repository_model_cls.DoesNotExist:
             repository = self.repository_model_cls(
@@ -131,53 +152,61 @@ class Replicator:
             repository.save()
         return repository
 
+    def distribution_extra_fields(self, repository, upstream_distribution):
+        """
+        Return the fields that need to be updated/cleared on distributions for idempotence.
+        """
+        return {
+            "repository": get_url(repository),
+            "publication": None,
+            "base_path": upstream_distribution["base_path"],
+        }
+
     def create_or_update_distribution(self, repository, upstream_distribution):
+        distribution_data = self.distribution_extra_fields(repository, upstream_distribution)
         try:
             distro = self.distribution_model_cls.objects.get(
                 name=upstream_distribution["name"], pulp_domain=self.domain
             )
-            # Check that the distribution has the right repository associated
-            needs_update = self.needs_update(
-                {
-                    "repository": get_url(repository),
-                    "base_path": upstream_distribution["base_path"],
-                },
-                distro,
-            )
+            needs_update = self.needs_update(distribution_data, distro)
             if needs_update:
                 # Update the distribution
                 dispatch(
                     general_update,
                     task_group=self.task_group,
-                    exclusive_resources=[self.distros_uri],
+                    shared_resources=[repository],
+                    exclusive_resources=self.distros_uris,
                     args=(distro.pk, self.app_label, self.distribution_serializer_name),
                     kwargs={
-                        "data": {
-                            "name": upstream_distribution["name"],
-                            "base_path": upstream_distribution["base_path"],
-                            "repository": get_url(repository),
-                        }
+                        "data": distribution_data,
+                        "partial": True,
                     },
                 )
         except self.distribution_model_cls.DoesNotExist:
             # Dispatch a task to create the distribution
+            distribution_data["name"] = upstream_distribution["name"]
             dispatch(
                 general_create,
                 task_group=self.task_group,
-                exclusive_resources=[self.distros_uri],
+                shared_resources=[repository],
+                exclusive_resources=self.distros_uris,
                 args=(self.app_label, self.distribution_serializer_name),
-                kwargs={
-                    "data": {
-                        "name": upstream_distribution["name"],
-                        "base_path": upstream_distribution["base_path"],
-                        "repository": get_url(repository),
-                    }
-                },
+                kwargs={"data": distribution_data},
             )
 
     def sync_params(self, repository, remote):
         """This method returns a dict that will be passed as kwargs to the sync task."""
         raise NotImplementedError("Each replicator must supply its own sync params.")
+
+    def requires_syncing(self, distro):
+        no_content_change_since = _read_content_change_since_timestamp(distro)
+        if no_content_change_since and self.server.last_replication:
+            if self.server.last_replication < self.server.pulp_last_updated:
+                return True
+            if self.server.last_replication > no_content_change_since:
+                return False
+
+        return True
 
     def sync(self, repository, remote):
         dispatch(
@@ -190,31 +219,47 @@ class Replicator:
 
     def remove_missing(self, names):
         # Remove all distributions with names not present in the list of names
-        distros_to_delete = self.distribution_model_cls.objects.filter(
-            pulp_domain=self.domain
-        ).exclude(name__in=names)
-        for distro in distros_to_delete:
+        # Perform this in an extra task, because we hold a big lock here.
+        distribution_ids = [
+            (distribution.pk, self.app_label, self.distribution_serializer_name)
+            for distribution in self.distribution_model_cls.objects.filter(
+                pulp_domain=self.domain
+            ).exclude(name__in=names)
+        ]
+        if distribution_ids:
             dispatch(
-                general_delete,
+                general_multi_delete,
                 task_group=self.task_group,
-                exclusive_resources=[self.distros_uri],
-                args=(distro.pk, self.app_label, self.distribution_serializer_name),
+                exclusive_resources=self.distros_uris,
+                args=(distribution_ids,),
             )
 
         # Remove all the repositories and remotes of the missing distributions
-        repos_to_delete = self.repository_model_cls.objects.exclude(name__in=names)
-        for repo in repos_to_delete:
+        repositories = list(
+            self.repository_model_cls.objects.filter(
+                pulp_domain=self.domain, user_hidden=False
+            ).exclude(name__in=names)
+        )
+        repository_ids = [
+            (repo.pk, self.app_label, self.repository_serializer_name) for repo in repositories
+        ]
+
+        remotes = list(
+            self.remote_model_cls.objects.filter(pulp_domain=self.domain).exclude(name__in=names)
+        )
+        remote_ids = [
+            (remote.pk, self.app_label, self.remote_serializer_name) for remote in remotes
+        ]
+
+        if repository_ids or remote_ids:
             dispatch(
-                general_delete,
+                general_multi_delete,
                 task_group=self.task_group,
-                exclusive_resources=[repo],
-                args=(repo.pk, self.app_label, self.repository_serializer_name),
+                exclusive_resources=repositories + remotes,
+                args=(repository_ids + remote_ids,),
             )
-        remotes_to_delete = self.remote_model_cls.objects.exclude(name__in=names)
-        for remote in remotes_to_delete:
-            dispatch(
-                general_delete,
-                task_group=self.task_group,
-                exclusive_resources=[remote],
-                args=(remote.pk, self.app_label, self.remote_serializer_name),
-            )
+
+
+def _read_content_change_since_timestamp(distribution):
+    if no_content_change_since := distribution.get("no_content_change_since"):
+        return parse_datetime(no_content_change_since)

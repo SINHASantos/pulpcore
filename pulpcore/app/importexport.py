@@ -9,6 +9,7 @@ from django.conf import settings
 from django.db.models.query import QuerySet
 
 from pulpcore.app.apps import get_plugin_config
+from pulpcore.app.models.content import Artifact
 from pulpcore.app.models.progress import ProgressReport
 from pulpcore.app.models.repository import Repository
 from pulpcore.app.modelresource import (
@@ -48,15 +49,25 @@ def _write_export(the_tarfile, resource, dest_dir=None):
     with tempfile.NamedTemporaryFile(dir=".", mode="w", encoding="utf8") as temp_file:
         if isinstance(resource.queryset, QuerySet):
             temp_file.write("[")
-            total = resource.queryset.count()
-            for i in range(0, total, EXPORT_BATCH_SIZE):
-                current_batch = i + EXPORT_BATCH_SIZE
-                dataset = resource.export(resource.queryset[i:current_batch])
+
+            def process_batch(batch):
+                model = resource.queryset.model
+                queryset = model.objects.filter(pk__in=batch)
+                dataset = resource.export(queryset)
                 # Strip "[" and "]" as we are writing the dataset in batch
                 temp_file.write(dataset.json.lstrip("[").rstrip("]"))
-                if current_batch < total:
-                    # Write "," if not last loop
+
+            first_loop = True
+            resource_pks = resource.queryset.values_list("pk", flat=True)
+            for offset in range(0, len(resource_pks), EXPORT_BATCH_SIZE):
+                batch = resource_pks[offset : offset + EXPORT_BATCH_SIZE]
+
+                if not first_loop:
                     temp_file.write(", ")
+                else:
+                    first_loop = False
+                process_batch(batch)
+
             temp_file.write("]")
         else:
             dataset = resource.export(resource.queryset)
@@ -77,7 +88,7 @@ def export_versions(export, version_info):
 
     Args:
         export (django.db.models.PulpExport): export instance that's doing the export
-        version_info (set): set of (distribution-label,version) tuples for repos in this export
+        version_info (set): iterable of (distribution-label,version) tuples for repos in this export
     """
     # build the version-list from the distributions for each component
     versions = [{"component": label, "version": version} for (label, version) in version_info]
@@ -88,33 +99,48 @@ def export_versions(export, version_info):
     export.tarfile.addfile(info, io.BytesIO(version_json))
 
 
-def export_artifacts(export, artifacts):
+def export_artifacts(export, artifact_pks):
     """
     Export a set of Artifacts, ArtifactResources, and RepositoryResources
 
     Args:
         export (django.db.models.PulpExport): export instance that's doing the export
-        artifacts (django.db.models.Artifacts): list of artifacts in all repos being exported
+        artifact_pks (django.db.models.Artifacts): List of artifact_pks in all repos being exported
 
     Raises:
         ValidationError: When path is not in the ALLOWED_EXPORT_PATHS setting
     """
-    data = dict(message="Exporting Artifacts", code="export.artifacts", total=len(artifacts))
+    data = dict(message="Exporting Artifacts", code="export.artifacts", total=len(artifact_pks))
     with ProgressReport(**data) as pb:
-        for artifact in pb.iter(artifacts):
-            dest = artifact.file.name
-            if settings.DEFAULT_FILE_STORAGE != "pulpcore.app.models.storage.FileSystem":
-                with tempfile.TemporaryDirectory(dir=".") as temp_dir:
-                    with tempfile.NamedTemporaryFile(dir=temp_dir) as temp_file:
-                        temp_file.write(artifact.file.read())
-                        temp_file.flush()
-                        artifact.file.close()
-                        export.tarfile.add(temp_file.name, dest)
-            else:
-                export.tarfile.add(artifact.file.path, dest)
+        pb.BATCH_INTERVAL = 5000
+
+        if settings.STORAGES["default"]["BACKEND"] != "pulpcore.app.models.storage.FileSystem":
+            with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+                for offset in range(0, len(artifact_pks), EXPORT_BATCH_SIZE):
+                    batch = artifact_pks[offset : offset + EXPORT_BATCH_SIZE]
+                    batch_qs = Artifact.objects.filter(pk__in=batch).only("file")
+
+                    for artifact in pb.iter(batch_qs.iterator()):
+                        with tempfile.NamedTemporaryFile(dir=temp_dir) as temp_file:
+                            # TODO: this looks like a memory usage threat
+                            # TODO: it's probably very slow, going one-by-one over the net
+                            # TODO: probably we could skip the temp file entirely and add
+                            #       artifact.file.read() directly to the tarfile with
+                            #       tarfile.addfile()
+                            temp_file.write(artifact.file.read())
+                            temp_file.flush()
+                            artifact.file.close()
+                            export.tarfile.add(temp_file.name, artifact.file.name)
+        else:
+            for offset in range(0, len(artifact_pks), EXPORT_BATCH_SIZE):
+                batch = artifact_pks[offset : offset + EXPORT_BATCH_SIZE]
+                batch_qs = Artifact.objects.filter(pk__in=batch).only("file")
+
+                for artifact in pb.iter(batch_qs.iterator()):
+                    export.tarfile.add(artifact.file.path, artifact.file.name)
 
     resource = ArtifactResource()
-    resource.queryset = artifacts
+    resource.queryset = Artifact.objects.filter(pk__in=artifact_pks)
     _write_export(export.tarfile, resource)
 
     resource = RepositoryResource()
