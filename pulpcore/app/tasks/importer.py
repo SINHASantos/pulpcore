@@ -1,21 +1,21 @@
-import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 import tarfile
+from contextlib import ExitStack, nullcontext
 from gettext import gettext as _
 from logging import getLogger
 
+import json_stream
+from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db.models import F
-from naya.json import stream_array, tokenize
 from io import StringIO
-from pkg_resources import DistributionNotFound, get_distribution
 from rest_framework.serializers import ValidationError
 from tablib import Dataset
 
+from pulpcore.exceptions.plugin import MissingPlugin
 from pulpcore.app.apps import get_plugin_config
 from pulpcore.app.models import (
     Artifact,
@@ -28,12 +28,14 @@ from pulpcore.app.models import (
     Repository,
     Task,
     TaskGroup,
+    Worker,
 )
 from pulpcore.app.modelresource import (
     ArtifactResource,
     ContentArtifactResource,
     RepositoryResource,
 )
+from pulpcore.app.util import compute_file_hash, Crc32Hasher
 from pulpcore.constants import TASK_STATES
 from pulpcore.tasking.tasks import dispatch
 
@@ -55,6 +57,137 @@ IMPORT_BATCH_SIZE = 100
 MAX_ATTEMPTS = 3
 
 
+class ChunkedFile(ExitStack):
+    """
+    Read a toc file and represent the reconstructed file as a fileobj.
+
+    This class implements just enough of the fileobj interface to let `tarfile` work on a bunch of
+    file chunks.
+
+    `validate_chunks` can be called after `__init__` to verify the existance and checksums of the
+    chunks. All other operations need to be done using this object as a context manager.
+    """
+
+    def __init__(self, toc_path):
+        super().__init__()
+        with open(toc_path, "r") as toc_file:
+            self.toc = json.load(toc_file)
+        if "files" not in self.toc or "meta" not in self.toc:
+            raise ValidationError(_("Missing 'files' or 'meta' keys in table-of-contents!"))
+
+        toc_dir = os.path.dirname(toc_path)
+        # sorting-by-filename is REALLY IMPORTANT here
+        # keys are of the form <base-export-name>.00..<base-export-name>.NN,
+        # and must be reassembled IN ORDER
+        self.chunk_names = sorted(self.toc["files"].keys())
+        self.chunk_paths = [os.path.join(toc_dir, chunk_name) for chunk_name in self.chunk_names]
+        self.chunk_size = int(self.toc["meta"].get("chunk_size", 0))
+        if not self.chunk_size:
+            assert (
+                len(self.toc["files"]) == 1
+            ), "chunk_size must exist and be non-zero if more than one chunk exists"
+            self.chunk_size = os.path.getsize(self.chunk_paths[0])
+
+    def __enter__(self):
+        assert not hasattr(self, "chunks"), "ChunkedFile is not reentrant."
+        super().__enter__()
+        self.chunks = [
+            self.enter_context(open(chunk_path, "rb")) for chunk_path in self.chunk_paths
+        ]
+        self.chunk = 0
+        self.offset = 0
+        return self
+
+    def __exit__(self, *exc):
+        super().__exit__(*exc)
+        del self.chunks
+        del self.chunk
+        del self.offset
+
+    def tell(self):
+        return self.chunk_size * self.chunk + self.offset
+
+    def read(self, size):
+        data = b""  # Accumulator
+        remaining_size = size
+        while True:
+            assert remaining_size > 0
+            current_size = min(self.chunk_size - self.offset, remaining_size)
+            piece = self.chunks[self.chunk].read(current_size)
+            read_size = len(piece)
+            data += piece
+            self.offset += read_size
+            remaining_size -= read_size
+            if read_size < current_size:
+                # Reached EOF (should only happen on the last chunk)
+                if self.chunk != len(self.chunks) - 1:
+                    raise Exception(f"Short read from chunk {self.chunk}.")
+                return data
+            if remaining_size == 0:
+                return data
+            if self.chunk == len(self.chunks) - 1:
+                return data
+            assert self.offset == self.chunk_size
+            self.chunk += 1
+            self.offset = 0
+            self.chunks[self.chunk].seek(0)
+
+    def seek(self, target, whence=0):
+        assert whence == 0  # not implemented... (also not needed either)
+        self.chunk = target // self.chunk_size
+        self.offset = target % self.chunk_size
+        self.chunks[self.chunk].seek(self.offset)
+
+    def validate_chunks(self):
+        """
+        Check validity of table-of-contents file.
+
+        table-of-contents must:
+          * exist
+          * be valid JSON
+          * point to chunked-export-files that exist 'next to' the 'toc' file
+          * point to chunks whose checksums match the checksums stored in the 'toc' file
+
+        Raises:
+            ValidationError: When toc points to chunked-export-files that can't be found in the
+            same directory as the toc-file, or the checksums of the chunks do not match the
+            checksums stored in toc.
+        """
+        # Check all chunks exist
+        missing_files = []
+        for chunk_path in self.chunk_paths:
+            if not os.path.isfile(chunk_path):
+                missing_files.append(chunk_path)
+        if missing_files:
+            raise ValidationError(
+                _(
+                    "Missing import-chunks named in table-of-contents: {}.".format(
+                        str(missing_files)
+                    )
+                )
+            )
+
+        errs = []
+        # validate the digests of the toc-entries
+        # gather errors for reporting at the end
+        data = dict(
+            message="Validating Chunks", code="validate.chunks", total=len(self.chunk_paths)
+        )
+        with ProgressReport(**data) as pb:
+            for chunk_name, chunk_path in pb.iter(zip(self.chunk_names, self.chunk_paths)):
+                expected_hash = self.toc["files"][chunk_name]
+                chunk_hash = compute_file_hash(chunk_path, hasher=Crc32Hasher())
+                if chunk_hash != expected_hash:
+                    err_str = "File {} expected checksum : {}, computed checksum : {}".format(
+                        chunk_name, expected_hash, chunk_hash
+                    )
+                    errs.append(err_str)
+
+        # if there are any errors, report and fail
+        if errs:
+            raise ValidationError(_("Import chunk hash mismatch: {}).").format(str(errs)))
+
+
 def _get_destination_repo_name(importer, source_repo_name):
     """
     Return the name of a destination repository considering the mapping or source repository name.
@@ -74,17 +207,14 @@ def _impfile_iterator(fd):
     we yield the result of json.dumps() for that batch. Repeat until all rows have been
     called for.
     """
-    eof = False
+    data = json_stream.load(fd)
     batch = []
-    rows = stream_array(tokenize(fd))
-    while not eof:
-        try:
-            while len(batch) < IMPORT_BATCH_SIZE:
-                batch.append(next(rows))
-        except StopIteration:
-            eof = True
-        yield json.dumps(batch)
-        batch.clear()
+    for row in data:
+        batch.append(json_stream.to_standard_types(row))
+        if len(batch) >= IMPORT_BATCH_SIZE:
+            yield json.dumps(batch)
+            batch.clear()
+    yield json.dumps(batch)
 
 
 def _import_file(fpath, resource_class, retry=False):
@@ -157,8 +287,8 @@ def _check_versions(version_json):
     error_messages = []
     for component in version_json:
         try:
-            version = get_distribution(component["component"]).version
-        except DistributionNotFound:
+            version = get_plugin_config(component["component"]).version
+        except MissingPlugin:
             error_messages.append(
                 _("Export uses {} which is not installed.").format(component["component"])
             )
@@ -183,7 +313,7 @@ def _check_versions(version_json):
 
 
 def import_repository_version(
-    importer_pk, src_repo_name, src_repo_type, dest_repo_name, dest_repo_pk, tar_path
+    importer_pk, src_repo_name, src_repo_type, dest_repo_name, dest_repo_pk, tar_path, toc_path=None
 ):
     """
     Import a repository version from a Pulp export.
@@ -195,6 +325,7 @@ def import_repository_version(
         dest_repo_name (str): The name of a repository where the content will be imported.
         dest_repo_pk (str): The primary key of a destination repository if any
         tar_path (str): The path of an exported tarball.
+        toc_path (str): The path to the TableOfContents file for the import (if it was provided).
     """
     importer = PulpImporter.objects.get(pk=importer_pk)
 
@@ -206,26 +337,39 @@ def import_repository_version(
     pb.save()
 
     with tempfile.TemporaryDirectory(dir=".") as temp_dir:
+        if toc_path:
+            fileobj = ChunkedFile(toc_path)
+        else:
+            fileobj = nullcontext()
         # Extract the repo file for the repo info
-        with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extract(REPO_FILE, path=temp_dir)
+        with fileobj as fp:
+            with tarfile.open(tar_path, "r", fileobj=fp) as tar:
+                tar.extract(REPO_FILE, path=temp_dir)
 
-        rv_name = ""
-        # Extract the repo version files
-        with tarfile.open(tar_path, "r:gz") as tar:
-            for mem in tar.getmembers():
-                match = re.search(rf"(^repository-{src_repo_name}_[0-9]+)/.+", mem.name)
-                if match:
-                    rv_name = match.group(1)
-                    tar.extract(mem, path=temp_dir)
+                rv_name = ""
+                # Extract the repo version files
+                for mem in tar.getmembers():
+                    match = re.search(rf"(^repository-{src_repo_name}_[0-9]+)/.+", mem.name)
+                    if match:
+                        rv_name = match.group(1)
+                        tar.extract(mem, path=temp_dir)
 
-        if not rv_name:
-            raise ValidationError(_("No RepositoryVersion found for {}").format(rv_name))
+                if not rv_name:
+                    raise ValidationError(_("No RepositoryVersion found for {}").format(rv_name))
 
-        rv_path = os.path.join(temp_dir, rv_name)
+                rv_path = os.path.join(temp_dir, rv_name)
+
+                # see if we have a Content mapping
+                mapping_path = f"{rv_name}/{CONTENT_MAPPING_FILE}"
+                mapping = {}
+                if mapping_path in tar.getnames():
+                    tar.extract(mapping_path, path=temp_dir)
+                    with open(os.path.join(temp_dir, mapping_path), "r") as mapping_file:
+                        mapping = json.load(mapping_file)
+
         # Content
-        plugin_name = src_repo_type.split(".")[0]
-        cfg = get_plugin_config(plugin_name)
+        app_label = src_repo_type.split(".")[0]
+        cfg = get_plugin_config(app_label)
 
         resulting_content_ids = []
         for res_class in cfg.exportable_classes:
@@ -239,7 +383,7 @@ def import_repository_version(
                     if repo_resource.import_type in ("new", "update"):
                         dest_repo_pk = repo_resource.object_id
 
-                if issubclass(res_class, BaseContentResource):
+                if not mapping and issubclass(res_class, BaseContentResource):
                     resulting_content_ids.extend(
                         row.object_id
                         for row in a_result.rows
@@ -252,15 +396,6 @@ def import_repository_version(
         for a_batch in _import_file(ca_path, ContentArtifactResource, retry=True):
             pass
 
-        # see if we have a content mapping
-        mapping_path = f"{rv_name}/{CONTENT_MAPPING_FILE}"
-        mapping = {}
-        with tarfile.open(tar_path, "r:gz") as tar:
-            if mapping_path in tar.getnames():
-                tar.extract(mapping_path, path=temp_dir)
-                with open(os.path.join(temp_dir, mapping_path), "r") as mapping_file:
-                    mapping = json.load(mapping_file)
-
         content_count = 0
         if mapping:
             # use the content mapping to map content to repos
@@ -268,14 +403,14 @@ def import_repository_version(
                 repo_name = _get_destination_repo_name(importer, repo_name)
                 dest_repo = Repository.objects.get(name=repo_name)
                 content = Content.objects.filter(upstream_id__in=content_ids)
-                content_count += content.count()
+                content_count += len(content_ids)
                 with dest_repo.new_version() as new_version:
                     new_version.set_content(content)
         else:
             # just map all the content to our destination repo
             dest_repo = Repository.objects.get(pk=dest_repo_pk)
             content = Content.objects.filter(pk__in=resulting_content_ids)
-            content_count += content.count()
+            content_count += len(resulting_content_ids)
             with dest_repo.new_version() as new_version:
                 new_version.set_content(content)
 
@@ -301,156 +436,13 @@ def pulp_import(importer_pk, path, toc, create_repositories):
             created or not.
     """
 
-    def _compute_hash(filename):
-        sha256_hash = hashlib.sha256()
-        with open(filename, "rb") as f:
-            # Read and update hash string value in blocks of 4K
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-            return sha256_hash.hexdigest()
-
-    def validate_toc(toc_filename):
-        """
-        Check validity of table-of-contents file.
-
-        table-of-contents must:
-          * exist
-          * be valid JSON
-          * point to chunked-export-files that exist 'next to' the 'toc' file
-          * point to chunks whose checksums match the checksums stored in the 'toc' file
-
-        Args:
-            toc_filename (str): The user-provided toc-file-path to be validated.
-
-        Raises:
-            ValidationError: If toc is not a valid JSON table-of-contents file,
-            or when toc points to chunked-export-files that can't be found in the same
-            directory as the toc-file, or the checksums of the chunks do not match the
-            checksums stored in toc.
-        """
-        with open(toc_filename) as json_file:
-            # Valid JSON?
-            the_toc = json.load(json_file)
-            if not the_toc.get("files", None) or not the_toc.get("meta", None):
-                raise ValidationError(_("Missing 'files' or 'meta' keys in table-of-contents!"))
-
-            base_dir = os.path.dirname(toc_filename)
-
-            # Regardless of what the TOC says, it's possible for a previous import to have
-            # failed after successfully creating the combined file. If the TOC specifies multiple
-            # chunks, but the "expected result" exists, ignore the chunk-list and process as if
-            # it's all there ever was.
-            top_level_file = os.path.join(base_dir, the_toc["meta"]["file"])
-            if len(the_toc["files"]) > 1 and os.path.isfile(top_level_file):
-                the_toc["files"] = {the_toc["meta"]["file"]: the_toc["meta"]["global_hash"]}
-
-            # At this point, we either have the original chunks, or we're validating the
-            # full-file as a single chunk. Validate the hash(es).
-
-            # Points at chunks that exist?
-            missing_files = []
-            for f in sorted(the_toc["files"].keys()):
-                if not os.path.isfile(os.path.join(base_dir, f)):
-                    missing_files.append(f)
-            if missing_files:
-                raise ValidationError(
-                    _(
-                        "Missing import-chunks named in table-of-contents: {}.".format(
-                            str(missing_files)
-                        )
-                    )
-                )
-
-            errs = []
-            # validate the sha256 of the toc-entries
-            # gather errors for reporting at the end
-            chunks = sorted(the_toc["files"].keys())
-            data = dict(message="Validating Chunks", code="validate.chunks", total=len(chunks))
-            with ProgressReport(**data) as pb:
-                for chunk in pb.iter(chunks):
-                    a_hash = _compute_hash(os.path.join(base_dir, chunk))
-                    if not a_hash == the_toc["files"][chunk]:
-                        err_str = "File {} expected checksum : {}, computed checksum : {}".format(
-                            chunk, the_toc["files"][chunk], a_hash
-                        )
-                        errs.append(err_str)
-
-            # if there are any errors, report and fail
-            if errs:
-                raise ValidationError(_("Import chunk hash mismatch: {}).").format(str(errs)))
-
-        return the_toc
-
-    def reassemble(the_toc, toc_dir, result_file):
-        # reassemble into one file 'next to' the toc and return the resulting full-path
-        chunk_size = int(the_toc["meta"]["chunk_size"])
-        offset = 0
-        block_size = 1024
-        blocks_per_chunk = int(chunk_size / block_size)
-
-        # sorting-by-filename is REALLY IMPORTANT here
-        # keys are of the form <base-export-name>.00..<base-export-name>.NN,
-        # and must be reassembled IN ORDER
-        the_chunk_files = sorted(the_toc["files"].keys())
-
-        data = dict(
-            message="Recombining Chunks", code="recombine.chunks", total=len(the_chunk_files)
-        )
-        with ProgressReport(**data) as pb:
-            for chunk in pb.iter(the_chunk_files):
-                # For each chunk, add it to the reconstituted tar.gz, picking up where the previous
-                # chunk left off
-                subprocess.run(
-                    [
-                        "dd",
-                        "if={}".format(os.path.join(toc_dir, chunk)),
-                        "of={}".format(result_file),
-                        "bs={}".format(str(block_size)),
-                        "seek={}".format(str(offset)),
-                    ],
-                )
-                offset += blocks_per_chunk
-                # To keep from taking up All The Disk, we delete each chunk after it has been added
-                # to the recombined file.
-                try:
-                    subprocess.run(["rm", "-f", os.path.join(toc_dir, chunk)])
-                except OSError:
-                    log.warning(
-                        "Failed to remove chunk {} after recombining. Continuing.".format(
-                            os.path.join(toc_dir, chunk)
-                        ),
-                        exc_info=True,
-                    )
-
-        combined_hash = _compute_hash(result_file)
-        if combined_hash != the_toc["meta"]["global_hash"]:
-            raise ValidationError(
-                _("Mismatch between combined .tar.gz checksum [{}] and originating [{}]).").format(
-                    combined_hash, the_toc["meta"]["global_hash"]
-                )
-            )
-        # if we get this far, then: the chunk-files all existed, they all pass checksum validation,
-        # and there exists a combined .tar.gz, which *also* passes checksum-validation.
-        # Let the rest of the import process do its thing on the new combined-file.
-        return result_file
-
-    def validate_and_assemble(toc_filename):
-        """Validate checksums of, and reassemble, chunks in table-of-contents file."""
-        the_toc = validate_toc(toc_filename)
-        toc_dir = os.path.dirname(toc_filename)
-        result_file = os.path.join(toc_dir, the_toc["meta"]["file"])
-
-        # if we have only one entry in "files", it must be the full .tar.gz.
-        # Return the filename from the meta-section.
-        if len(the_toc["files"]) == 1:
-            return result_file
-
-        # We have multiple chunks. Reassemble them and return the result.
-        return reassemble(the_toc, toc_dir, result_file)
-
     if toc:
+        path = toc
+        fileobj = ChunkedFile(toc)
         log.info(_("Validating TOC {}.").format(toc))
-        path = validate_and_assemble(toc)
+        fileobj.validate_chunks()
+    else:
+        fileobj = nullcontext()
 
     log.info(_("Importing {}.").format(path))
     current_task = Task.current()
@@ -462,25 +454,26 @@ def pulp_import(importer_pk, path, toc, create_repositories):
     CreatedResource.objects.create(content_object=the_import)
 
     with tempfile.TemporaryDirectory(dir=".") as temp_dir:
-        with tarfile.open(path, "r:gz") as tar:
+        with fileobj as fp:
+            with tarfile.open(path, "r", fileobj=fp) as tar:
 
-            def is_within_directory(directory, target):
-                abs_directory = os.path.abspath(directory)
-                abs_target = os.path.abspath(target)
+                def is_within_directory(directory, target):
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
 
-                prefix = os.path.commonprefix([abs_directory, abs_target])
+                    prefix = os.path.commonprefix([abs_directory, abs_target])
 
-                return prefix == abs_directory
+                    return prefix == abs_directory
 
-            def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
-                for member in tar.getmembers():
-                    member_path = os.path.join(path, member.name)
-                    if not is_within_directory(path, member_path):
-                        raise Exception("Attempted Path Traversal in Tar File")
+                def safe_extract(tar, path=".", members=None, *, numeric_owner=False):
+                    for member in tar.getmembers():
+                        member_path = os.path.join(path, member.name)
+                        if not is_within_directory(path, member_path):
+                            raise Exception("Attempted Path Traversal in Tar File")
 
-                tar.extractall(path, members, numeric_owner=numeric_owner)
+                    tar.extractall(path, members, numeric_owner=numeric_owner)
 
-            safe_extract(tar, path=temp_dir)
+                safe_extract(tar, path=temp_dir)
 
         # Check version info
         with open(os.path.join(temp_dir, VERSIONS_FILE)) as version_file:
@@ -506,6 +499,18 @@ def pulp_import(importer_pk, path, toc, create_repositories):
                             default_storage.save(base_path, f)
 
         # Now import repositories, in parallel.
+
+        # We want to be able to limit the number of available-workers that import will consume,
+        # so that pulp can continue to work while doing an import. We accomplish this by creating
+        # a reserved-resource string for each repo-import-task based on that repo's index in
+        # the dispatch loop, mod number-of-workers-to-consume.
+        #
+        # By default (setting is not-set), import will continue to use 100% of the available
+        # workers.
+        import_workers_percent = int(settings.get("IMPORT_WORKERS_PERCENT", 100))
+        total_workers = Worker.objects.online().count()
+        import_workers = max(1, int(total_workers * (import_workers_percent / 100.0)))
+
         with open(os.path.join(temp_dir, REPO_FILE), "r") as repo_data_file:
             data = json.load(repo_data_file)
             gpr = GroupProgressReport(
@@ -517,14 +522,16 @@ def pulp_import(importer_pk, path, toc, create_repositories):
             )
             gpr.save()
 
-            for src_repo in data:
+            for index, src_repo in enumerate(data):
+                # Lock the repo we're importing-into
                 dest_repo_name = _get_destination_repo_name(importer, src_repo["name"])
-
+                # pulpcore-worker limiter
+                worker_rsrc = f"import-worker-{index % import_workers}"
+                exclusive_resources = [worker_rsrc]
                 try:
                     dest_repo = Repository.objects.get(name=dest_repo_name)
                 except Repository.DoesNotExist:
                     if create_repositories:
-                        exclusive_resources = []
                         dest_repo_pk = ""
                     else:
                         log.warning(
@@ -534,7 +541,7 @@ def pulp_import(importer_pk, path, toc, create_repositories):
                         )
                         continue
                 else:
-                    exclusive_resources = [dest_repo]
+                    exclusive_resources.append(dest_repo)
                     dest_repo_pk = dest_repo.pk
 
                 dispatch(
@@ -547,6 +554,7 @@ def pulp_import(importer_pk, path, toc, create_repositories):
                         dest_repo_name,
                         dest_repo_pk,
                         path,
+                        toc,
                     ),
                     task_group=task_group,
                 )

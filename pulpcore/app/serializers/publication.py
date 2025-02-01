@@ -108,6 +108,21 @@ class RBACContentGuardSerializer(ContentGuardSerializer):
         fields = ContentGuardSerializer.Meta.fields + ("users", "groups")
 
 
+class CompositeContentGuardSerializer(ContentGuardSerializer, GetOrCreateSerializerMixin):
+    guards = DetailRelatedField(
+        many=True,
+        required=False,
+        help_text=_("List of ContentGuards to ask for access-permission."),
+        view_name_pattern=r"contentguards(-.*/.*)?-detail",
+        queryset=models.ContentGuard.objects.all(),
+        allow_null=True,
+    )
+
+    class Meta:
+        model = models.CompositeContentGuard
+        fields = ContentGuardSerializer.Meta.fields + ("guards",)
+
+
 class RBACContentGuardPermissionSerializer(serializers.Serializer):
     usernames = serializers.ListField(default=[])
     groupnames = serializers.ListField(default=[])
@@ -120,6 +135,29 @@ class ContentRedirectContentGuardSerializer(ContentGuardSerializer, GetOrCreateS
 
     class Meta(ContentGuardSerializer.Meta):
         model = models.ContentRedirectContentGuard
+
+
+class HeaderContentGuardSerializer(ContentGuardSerializer, GetOrCreateSerializerMixin):
+    """
+    A serializer for HeaderContentGuard.
+    """
+
+    header_name = serializers.CharField(help_text=_("The header name the guard will check on."))
+    header_value = serializers.CharField(help_text=_("The value that will authorize the request."))
+    jq_filter = serializers.CharField(
+        help_text=_(
+            (
+                "A JQ syntax compatible filter. If jq_filter is not set, then the value will"
+                "only be Base64 decoded and checked as an explicit string match."
+            )
+        ),
+        allow_null=True,
+        required=False,
+    )
+
+    class Meta(ContentGuardSerializer.Meta):
+        model = models.HeaderContentGuard
+        fields = ContentGuardSerializer.Meta.fields + ("header_name", "header_value", "jq_filter")
 
 
 class DistributionSerializer(ModelSerializer):
@@ -194,6 +232,12 @@ class DistributionSerializer(ModelSerializer):
     hidden = serializers.BooleanField(
         default=False, help_text=_("Whether this distribution should be shown in the content app.")
     )
+    no_content_change_since = serializers.SerializerMethodField(
+        help_text=_(
+            "Timestamp since when the distributed content served by this distribution has "
+            "not changed. If equals to `null`, no guarantee is provided about content changes."
+        )
+    )
 
     class Meta:
         model = models.Distribution
@@ -201,6 +245,7 @@ class DistributionSerializer(ModelSerializer):
             "base_path",
             "base_url",
             "content_guard",
+            "no_content_change_since",
             "hidden",
             "pulp_labels",
             "name",
@@ -240,13 +285,13 @@ class DistributionSerializer(ModelSerializer):
         super().validate(data)
 
         repository_provided = data.get(
-            "repository", (self.instance and self.instance.repository) or None
+            "repository", (self.partial and self.instance.repository) or None
         )
         repository_version_provided = data.get(
-            "repository_version", (self.instance and self.instance.repository_version) or None
+            "repository_version", (self.partial and self.instance.repository_version) or None
         )
         publication_provided = data.get(
-            "publication", (self.instance and self.instance.publication) or None
+            "publication", (self.partial and self.instance.publication) or None
         )
 
         if publication_provided and repository_version_provided:
@@ -273,6 +318,15 @@ class DistributionSerializer(ModelSerializer):
             )
 
         return data
+
+    def get_no_content_change_since(self, obj):
+        publication = obj.publication
+        repo_version = obj.repository_version
+
+        if publication or (repo_version and not obj.SERVE_FROM_PUBLICATION):
+            return obj.pulp_last_updated
+        else:
+            return None
 
 
 class ArtifactDistributionSerializer(DistributionSerializer):

@@ -1,5 +1,4 @@
 from drf_spectacular.utils import extend_schema
-from django.conf import settings
 from rest_framework.views import APIView
 
 from pulpcore.app.response import OperationPostponedResponse
@@ -27,9 +26,9 @@ class RepairView(APIView):
 
         verify_checksums = serializer.validated_data["verify_checksums"]
 
-        uri = "/api/v3/repair/"
-        if settings.DOMAIN_ENABLED:
-            uri = f"/{request.pulp_domain.name}{uri}"
-        task = dispatch(repair_all_artifacts, exclusive_resources=[uri], args=[verify_checksums])
+        exclusive_resources = [f"pdrn:{request.pulp_domain.pulp_id}:repair"]
+        task = dispatch(
+            repair_all_artifacts, exclusive_resources=exclusive_resources, args=[verify_checksums]
+        )
 
         return OperationPostponedResponse(task, request)

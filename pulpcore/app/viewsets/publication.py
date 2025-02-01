@@ -4,15 +4,17 @@ from django.db.models import Prefetch
 from django_filters import Filter
 from rest_framework import mixins, serializers
 
+from pulpcore.app.models.publication import CompositeContentGuard
+from pulpcore.app.serializers.publication import CompositeContentGuardSerializer
 from pulpcore.filters import BaseFilterSet
 from pulpcore.app.models import (
     ContentGuard,
     RBACContentGuard,
     ContentRedirectContentGuard,
+    HeaderContentGuard,
     Distribution,
     Publication,
     Repository,
-    Content,
     ArtifactDistribution,
 )
 from pulpcore.app.serializers import (
@@ -21,12 +23,14 @@ from pulpcore.app.serializers import (
     PublicationSerializer,
     RBACContentGuardSerializer,
     ContentRedirectContentGuardSerializer,
+    HeaderContentGuardSerializer,
     ArtifactDistributionSerializer,
 )
 from pulpcore.app.viewsets import (
     AsyncCreateMixin,
     AsyncRemoveMixin,
     AsyncUpdateMixin,
+    LabelsMixin,
     NamedModelViewSet,
     RolesMixin,
 )
@@ -35,26 +39,10 @@ from pulpcore.app.viewsets.custom_filters import (
     DistributionWithContentFilter,
     LabelFilter,
     RepositoryVersionFilter,
+    WithContentFilter,
+    WithContentInFilter,
 )
-
-
-class PublicationContentFilter(Filter):
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("help_text", _("Content Unit referenced by HREF"))
-        super().__init__(*args, **kwargs)
-
-    def filter(self, qs, value):
-        if value is None:
-            # user didn't supply a value
-            return qs
-
-        if not value:
-            raise serializers.ValidationError(detail=_("No value supplied for content filter"))
-
-        # Get the content object from the content_href
-        content = NamedModelViewSet.get_resource(value, Content)
-
-        return qs.with_content([content.pk])
+from pulpcore.app.util import get_domain
 
 
 class RepositoryThroughVersionFilter(Filter):
@@ -73,10 +61,10 @@ class RepositoryThroughVersionFilter(Filter):
 
 
 class PublicationFilter(BaseFilterSet):
-    repository = RepositoryThroughVersionFilter(help_text=_("Repository referenced by HREF"))
+    repository = RepositoryThroughVersionFilter(help_text=_("Repository referenced by HREF/PRN"))
     repository_version = RepositoryVersionFilter()
-    content = PublicationContentFilter()
-    content__in = PublicationContentFilter(field_name="content", lookup_expr="in")
+    content = WithContentFilter()
+    content__in = WithContentInFilter()
 
     class Meta:
         model = Publication
@@ -354,6 +342,146 @@ class ContentRedirectContentGuardViewSet(ContentGuardViewSet, RolesMixin):
     }
 
 
+class HeaderContentGuardViewSet(ContentGuardViewSet, RolesMixin):
+    """
+    Content guard to protect the content app using a specific header.
+    """
+
+    endpoint_name = "header"
+    queryset = HeaderContentGuard.objects.all()
+    serializer_class = HeaderContentGuardSerializer
+    queryset_filtering_required_permission = "core.view_headercontentguard"
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+            {
+                "action": ["create"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_perms:core.add_headercontentguard",
+            },
+            {
+                "action": ["retrieve", "my_permissions"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_or_obj_perms:core.view_headercontentguard",
+            },
+            {
+                "action": ["update", "partial_update"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": ("has_model_or_domain_or_obj_perms:core.change_headercontentguard"),
+            },
+            {
+                "action": ["destroy"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": ("has_model_or_domain_or_obj_perms:core.delete_headercontentguard"),
+            },
+            {
+                "action": ["list_roles", "add_role", "remove_role"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": (
+                    "has_model_or_domain_or_obj_perms:core.manage_roles_headercontentguard"
+                ),
+            },
+        ],
+        "creation_hooks": [
+            {
+                "function": "add_roles_for_object_creator",
+                "parameters": {"roles": ["core.headercontentguard_owner"]},
+            },
+        ],
+        "queryset_scoping": {"function": "scope_queryset"},
+    }
+    LOCKED_ROLES = {
+        "core.headercontentguard_creator": ["core.add_headercontentguard"],
+        "core.headercontentguard_owner": [
+            "core.view_headercontentguard",
+            "core.change_headercontentguard",
+            "core.delete_headercontentguard",
+            "core.manage_roles_headercontentguard",
+        ],
+        "core.headercontentguard_viewer": ["core.view_headercontentguard"],
+    }
+
+
+class CompositeContentGuardViewSet(ContentGuardViewSet, RolesMixin):
+    """
+    Content guard that queries a list-of content-guards for access permissions.
+    """
+
+    endpoint_name = "composite"
+    queryset = CompositeContentGuard.objects.all()
+    serializer_class = CompositeContentGuardSerializer
+    queryset_filtering_required_permission = "core.view_compositecontentguard"
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+            {
+                "action": ["create"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_perms:core.add_compositecontentguard",
+            },
+            {
+                "action": ["retrieve", "my_permissions"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_or_obj_perms:core." "view_compositecontentguard",
+            },
+            {
+                "action": ["update", "partial_update"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": ("has_model_or_domain_or_obj_perms:core.change_compositecontentguard"),
+            },
+            {
+                "action": ["destroy"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": ("has_model_or_domain_or_obj_perms:core.delete_compositecontentguard"),
+            },
+            {
+                "action": ["list_roles", "add_role", "remove_role"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": (
+                    "has_model_or_domain_or_obj_perms:core.manage_roles_compositecontentguard"
+                ),
+            },
+        ],
+        "creation_hooks": [
+            {
+                "function": "add_roles_for_object_creator",
+                "parameters": {"roles": ["core.compositecontentguard_owner"]},
+            },
+        ],
+        "queryset_scoping": {"function": "scope_queryset"},
+    }
+    LOCKED_ROLES = {
+        "core.compositecontentguard_creator": ["core.add_compositecontentguard"],
+        "core.compositecontentguard_owner": [
+            "core.view_compositecontentguard",
+            "core.change_compositecontentguard",
+            "core.delete_compositecontentguard",
+            "core.manage_roles_compositecontentguard",
+        ],
+        "core.compositecontentguard_viewer": ["core.view_compositecontentguard"],
+    }
+
+
 class DistributionFilter(BaseFilterSet):
     # e.g.
     # /?name=foo
@@ -398,7 +526,7 @@ class BaseDistributionViewSet(NamedModelViewSet):
 
     def async_reserved_resources(self, instance):
         """Return resource that locks all Distributions."""
-        return ["/api/v3/distributions/"]
+        return [f"pdrn:{get_domain().pulp_id}:distributions"]
 
 
 class ListDistributionViewSet(BaseDistributionViewSet, mixins.ListModelMixin):
@@ -434,6 +562,7 @@ class DistributionViewSet(
     AsyncCreateMixin,
     AsyncRemoveMixin,
     AsyncUpdateMixin,
+    LabelsMixin,
 ):
     """
     Provides read and list methods and also provides asynchronous CUD methods to dispatch tasks

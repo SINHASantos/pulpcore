@@ -2,7 +2,11 @@ from gettext import gettext as _
 
 from rest_framework import serializers
 
-from pulpcore.app.serializers.task import ContentAppStatusSerializer, WorkerSerializer
+from pulpcore.app.serializers.task import (
+    ApiAppStatusSerializer,
+    ContentAppStatusSerializer,
+    WorkerSerializer,
+)
 
 
 class VersionSerializer(serializers.Serializer):
@@ -15,6 +19,8 @@ class VersionSerializer(serializers.Serializer):
     version = serializers.CharField(help_text=_("Version of the component (e.g. 3.0.0)"))
 
     package = serializers.CharField(help_text=_("Python package name providing the component"))
+
+    module = serializers.CharField(help_text=_("Python module name of the component"))
 
     domain_compatible = serializers.BooleanField(
         help_text=_("Domain feature compatibility of component")
@@ -46,11 +52,17 @@ class StorageSerializer(serializers.Serializer):
     Serializer for information about the storage system
     """
 
-    total = serializers.IntegerField(min_value=0, help_text=_("Total number of bytes"))
+    total = serializers.IntegerField(
+        min_value=0, help_text=_("Total number of bytes"), allow_null=True
+    )
 
-    used = serializers.IntegerField(min_value=0, help_text=_("Number of bytes in use"))
+    used = serializers.IntegerField(
+        min_value=0, help_text=_("Number of bytes in use"), allow_null=True
+    )
 
-    free = serializers.IntegerField(min_value=0, help_text=_("Number of free bytes"))
+    free = serializers.IntegerField(
+        min_value=0, help_text=_("Number of free bytes"), allow_null=True
+    )
 
 
 class ContentSettingsSerializer(serializers.Serializer):
@@ -60,6 +72,9 @@ class ContentSettingsSerializer(serializers.Serializer):
 
     content_origin = serializers.CharField(
         help_text=_("The CONTENT_ORIGIN setting for this Pulp instance"),
+        allow_blank=False,
+        allow_null=True,
+        required=False,
     )
     content_path_prefix = serializers.CharField(
         help_text=_("The CONTENT_PATH_PREFIX setting for this Pulp instance"),
@@ -76,7 +91,15 @@ class StatusSerializer(serializers.Serializer):
     online_workers = WorkerSerializer(
         help_text=_(
             "List of online workers known to the application. An online worker is actively "
-            "heartbeating and can respond to new work"
+            "heartbeating and can respond to new work."
+        ),
+        many=True,
+    )
+
+    online_api_apps = ApiAppStatusSerializer(
+        help_text=_(
+            "List of online api apps known to the application. An online api app "
+            "is actively heartbeating and can serve the rest api to clients."
         ),
         many=True,
     )
@@ -84,7 +107,7 @@ class StatusSerializer(serializers.Serializer):
     online_content_apps = ContentAppStatusSerializer(
         help_text=_(
             "List of online content apps known to the application. An online content app "
-            "is actively heartbeating and can serve data to clients"
+            "is actively heartbeating and can serve data to clients."
         ),
         many=True,
     )

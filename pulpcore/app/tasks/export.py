@@ -1,18 +1,18 @@
-import hashlib
 import json
 import logging
 import os
 import os.path
 import subprocess
 import tarfile
+
 from distutils.util import strtobool
 from gettext import gettext as _
 from glob import glob
 from pathlib import Path
-from pkg_resources import get_distribution
 
 from django.conf import settings
 
+from pulpcore.app.apps import get_plugin_config
 from pulpcore.app.models import (
     CreatedResource,
     ExportedResource,
@@ -21,12 +21,14 @@ from pulpcore.app.models import (
     Publication,
     PulpExport,
     PulpExporter,
+    Repository,
     RepositoryVersion,
     Task,
 )
 from pulpcore.app.models.content import ContentArtifact
 from pulpcore.app.serializers import PulpExportSerializer
-from pulpcore.app.util import get_version_from_model
+
+from pulpcore.app.util import compute_file_hash, Crc32Hasher
 from pulpcore.app.importexport import (
     export_versions,
     export_artifacts,
@@ -68,7 +70,7 @@ def _export_to_file_system(path, relative_paths_to_artifacts, method=FS_EXPORT_M
         ValidationError: When path is not in the ALLOWED_EXPORT_PATHS setting
     """
     using_filesystem_storage = (
-        settings.DEFAULT_FILE_STORAGE == "pulpcore.app.models.storage.FileSystem"
+        settings.STORAGES["default"]["BACKEND"] == "pulpcore.app.models.storage.FileSystem"
     )
 
     if method != FS_EXPORT_METHODS.WRITE and not using_filesystem_storage:
@@ -317,17 +319,12 @@ def _get_versions_info(the_exporter):
     """
     Return plugin-version-info based on plugins are responsible for exporter-repositories.
     """
-    repositories = the_exporter.repositories.all()
-
     # extract plugin-version-info based on the repositories we're exporting from
-    vers_info = set()
-    # We always need to know what version of pulpcore was in place
-    vers_info.add(("pulpcore", get_distribution("pulpcore").version))
-    # for each repository being exported, get the version-info for the plugin that
-    # owns/controls that kind-of repository
-    for r in repositories:
-        vers_info.add(get_version_from_model(r.cast()))
-
+    repositories = the_exporter.repositories.all()
+    repo_types = {r.pulp_type for r in repositories}
+    app_labels = {Repository.get_model_for_pulp_type(rt)._meta.app_label for rt in repo_types}
+    app_labels.add("core")
+    vers_info = [(app_label, get_plugin_config(app_label).version) for app_label in app_labels]
     return vers_info
 
 
@@ -366,7 +363,7 @@ def pulp_export(exporter_pk, params):
 
     1) Spit out all Artifacts, ArtifactResource.json, and RepositoryResource.json
     2) Spit out all *resource JSONs in per-repo-version directories
-    3) Compute and store the sha256 and filename of the resulting tar.gz/chunks
+    3) Compute and store the sha256 and filename of the resulting tar/chunks
 
     Args:
         exporter_pk (str): PulpExporter
@@ -384,6 +381,8 @@ def pulp_export(exporter_pk, params):
     the_export.validated_start_versions = serializer.validated_data.get("start_versions", None)
     the_export.validated_chunk_size = serializer.validated_data.get("chunk_size", None)
 
+    hasher = Crc32Hasher
+    checksum_type = "crc32"
     try:
         the_export.task = Task.current()
 
@@ -410,7 +409,11 @@ def pulp_export(exporter_pk, params):
                 stdin=subprocess.PIPE,
             ) as split_process:
                 try:
-                    with tarfile.open(tarfile_fp, "w|gz", fileobj=split_process.stdin) as tar:
+                    with tarfile.open(
+                        tarfile_fp,
+                        "w|",
+                        fileobj=split_process.stdin,
+                    ) as tar:
                         _do_export(pulp_exporter, tar, the_export)
                 except Exception:
                     # no matter what went wrong, we can't trust the files we (may have) created.
@@ -419,17 +422,15 @@ def pulp_export(exporter_pk, params):
                         os.remove(pathname)
                     raise
             # compute the hashes
-            global_hash = hashlib.sha256()
             paths = sorted([str(Path(p)) for p in glob(tarfile_fp + ".*")])
             for a_file in paths:
-                a_hash = _compute_hash(a_file, global_hash)
+                a_hash = compute_file_hash(a_file, hasher=hasher())
                 rslts[a_file] = a_hash
-            tarfile_hash = global_hash.hexdigest()
 
         else:
             # write into the file
             try:
-                with tarfile.open(tarfile_fp, "w:gz") as tar:
+                with tarfile.open(tarfile_fp, "w") as tar:
                     _do_export(pulp_exporter, tar, the_export)
             except Exception:
                 # no matter what went wrong, we can't trust the file we created.
@@ -438,34 +439,32 @@ def pulp_export(exporter_pk, params):
                     os.remove(tarfile_fp)
                 raise
             # compute the hash
-            tarfile_hash = _compute_hash(tarfile_fp)
+            tarfile_hash = compute_file_hash(tarfile_fp, hasher=hasher())
             rslts[tarfile_fp] = tarfile_hash
 
         # store the outputfile/hash info
         the_export.output_file_info = rslts
 
         # write outputfile/hash info to a file 'next to' the output file(s)
-        output_file_info_path = tarfile_fp.replace(".tar.gz", "-toc.json")
+        output_file_info_path = tarfile_fp.replace(".tar", "-toc.json")
         with open(output_file_info_path, "w") as outfile:
-            if the_export.validated_chunk_size:
-                chunk_size = the_export.validated_chunk_size
-            else:
-                chunk_size = 0
-            chunk_toc = {
+            table_of_contents = {
                 "meta": {
-                    "chunk_size": chunk_size,
-                    "file": os.path.basename(tarfile_fp),
-                    "global_hash": tarfile_hash,
+                    "checksum_type": checksum_type,
                 },
                 "files": {},
             }
+
+            if the_export.validated_chunk_size:
+                table_of_contents["meta"]["chunk_size"] = the_export.validated_chunk_size
+
             # Build a toc with just filenames (not the path on the exporter-machine)
             for a_path in rslts.keys():
-                chunk_toc["files"][os.path.basename(a_path)] = rslts[a_path]
-            json.dump(chunk_toc, outfile)
+                table_of_contents["files"][os.path.basename(a_path)] = rslts[a_path]
+            json.dump(table_of_contents, outfile)
 
         # store toc info
-        toc_hash = _compute_hash(output_file_info_path)
+        toc_hash = compute_file_hash(output_file_info_path)
         the_export.output_file_info[output_file_info_path] = toc_hash
         the_export.toc_info = {"file": output_file_info_path, "sha256": toc_hash}
     finally:
@@ -480,27 +479,21 @@ def pulp_export(exporter_pk, params):
     pulp_exporter.save()
 
 
-def _compute_hash(filename, global_hash=None):
-    sha256_hash = hashlib.sha256()
-    with open(filename, "rb") as f:
-        # Read and update hash string value in blocks of 4K
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-            if global_hash:
-                global_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-
-
 def _do_export(pulp_exporter, tar, the_export):
     the_export.tarfile = tar
     CreatedResource.objects.create(content_object=the_export)
-    ending_versions = _get_versions_to_export(pulp_exporter, the_export)
     plugin_version_info = _get_versions_info(pulp_exporter)
+
+    # export plugin-version-info
+    export_versions(the_export, plugin_version_info)
+
+    ending_versions = _get_versions_to_export(pulp_exporter, the_export)
     do_incremental = _incremental_requested(the_export)
     starting_versions = _get_starting_versions(do_incremental, pulp_exporter, the_export)
     vers_match = _version_match(ending_versions, starting_versions)
+
     # Gather up versions and artifacts
-    artifacts = []
+    artifact_pks = set()
     for version in ending_versions:
         # Check version-content to make sure we're not being asked to export
         # an on_demand repo
@@ -509,15 +502,16 @@ def _do_export(pulp_exporter, tar, the_export):
             raise RuntimeError(_("Remote artifacts cannot be exported."))
 
         if do_incremental:
-            vers_artifacts = version.artifacts.difference(vers_match[version].artifacts).all()
+            vers_artifacts = version.artifacts.difference(vers_match[version].artifacts)
         else:
-            vers_artifacts = version.artifacts.all()
-        artifacts.extend(vers_artifacts)
-    # export plugin-version-info
-    export_versions(the_export, plugin_version_info)
+            vers_artifacts = version.artifacts
+        artifact_pks.update(vers_artifacts.values_list("pk", flat=True))
+
     # Export the top-level entities (artifacts and repositories)
     # Note: we've already handled "what about incrementals" when building the 'artifacts' list
-    export_artifacts(the_export, artifacts)
+    export_artifacts(the_export, list(artifact_pks))
+    del artifact_pks
+
     # Export the repository-version data, per-version
     for version in ending_versions:
         export_content(the_export, version)

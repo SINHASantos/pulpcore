@@ -1,10 +1,13 @@
 from gettext import gettext as _
 
+from django.conf import settings
 from django.db import models
-from rest_framework import mixins, permissions, status
+from django_filters import NumberFilter
+from rest_framework import mixins, status
 from rest_framework.response import Response
 
 from pulpcore.filters import BaseFilterSet
+from pulpcore.app.loggers import deprecation_logger
 from pulpcore.app.models import Artifact, Content, PublishedMetadata, SigningService
 from pulpcore.app.serializers import (
     ArtifactSerializer,
@@ -22,6 +25,17 @@ from .custom_filters import (
 )
 
 
+class OrphanedFilter(NumberFilter):
+    def filter(self, qs, value):
+        if value is not None:
+            if value < 0:
+                time = settings.ORPHAN_PROTECTION_TIME
+            else:
+                time = value
+            qs = qs.orphaned(int(time))
+        return qs
+
+
 class ArtifactFilter(BaseFilterSet):
     """
     Artifact filter Plugin content filters should:
@@ -33,6 +47,9 @@ class ArtifactFilter(BaseFilterSet):
     """
 
     repository_version = ArtifactRepositoryVersionFilter()
+    orphaned_for = OrphanedFilter(
+        help_text="Minutes Artifacts have been orphaned for. -1 uses ORPHAN_PROTECTION_TIME."
+    )
 
     class Meta:
         model = Artifact
@@ -57,12 +74,29 @@ class ArtifactViewSet(
     queryset = Artifact.objects.all()
     serializer_class = ArtifactSerializer
     filterset_class = ArtifactFilter
-    permission_classes = (permissions.IsAuthenticated,)
 
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["create", "list", "retrieve"],
+                "principal": "admin",
+                "effect": "allow",
+            },
+        ],
+    }
+
+    # Deleting artifacts is a risky operation and will be removed in a future release.
+    # However, for compatibility reasons, it is still possible to execute the DELETE
+    # request by overriding the DEFAULT_ACCESS_POLICY.
     def destroy(self, request, pk):
         """
         Remove Artifact only if it is not associated with any Content.
         """
+        msg = _(
+            "destroy is deprecated. Deleting artifacts is a dangerous operation, "
+            "use orphan cleanup instead."
+        )
+        deprecation_logger.warning(msg)
         try:
             return super().destroy(request, pk)
         except models.ProtectedError:
@@ -90,11 +124,17 @@ class ContentFilter(BaseFilterSet):
             Return Content which was added in this repository version.
         repository_version_removed:
             Return Content which was removed from this repository version.
+        orphaned_for:
+            Return Content which has been orphaned for a given number of minutes;
+            -1 uses ORPHAN_PROTECTION_TIME value.
     """
 
     repository_version = ContentRepositoryVersionFilter()
     repository_version_added = ContentAddedRepositoryVersionFilter()
     repository_version_removed = ContentRemovedRepositoryVersionFilter()
+    orphaned_for = OrphanedFilter(
+        help_text="Minutes Content has been orphaned for. -1 uses ORPHAN_PROTECTION_TIME."
+    )
 
 
 class BaseContentViewSet(NamedModelViewSet):

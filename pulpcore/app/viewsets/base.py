@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models.expressions import RawSQL
 from django.core.exceptions import FieldError, ValidationError
 from django.urls import Resolver404, resolve
 from django.contrib.contenttypes.models import ContentType
@@ -20,16 +21,31 @@ from pulpcore.app.models import MasterModel
 from pulpcore.app.models.role import GroupRole, UserRole
 from pulpcore.app.response import OperationPostponedResponse
 from pulpcore.app.role_util import get_objects_for_user
-from pulpcore.app.serializers import AsyncOperationResponseSerializer, NestedRoleSerializer
-from pulpcore.app.util import get_viewset_for_model
+from pulpcore.app.serializers import (
+    AsyncOperationResponseSerializer,
+    NestedRoleSerializer,
+    SetLabelSerializer,
+    UnsetLabelSerializer,
+)
+from pulpcore.app.util import get_viewset_for_model, resolve_prn
 from pulpcore.tasking.tasks import dispatch
 
 # These should be used to prevent duplication and keep things consistent
-NAME_FILTER_OPTIONS = ["exact", "in", "icontains", "contains", "startswith"]
+NAME_FILTER_OPTIONS = [
+    "exact",
+    "iexact",
+    "in",
+    "contains",
+    "icontains",
+    "startswith",
+    "istartswith",
+    "regex",
+    "iregex",
+]
 # e.g.
 # /?name=foo
 # /?name__in=foo,bar
-DATETIME_FILTER_OPTIONS = ["exact", "lt", "lte", "gt", "gte", "range"]
+DATETIME_FILTER_OPTIONS = ["exact", "lt", "lte", "gt", "gte", "range", "isnull"]
 # e.g.
 # /?pulp_created__gte=2018-04-12T19:45:52
 # /?pulp_created__range=2018-04-12T19:45:52,2018-04-13T19:45:52
@@ -142,40 +158,50 @@ class NamedModelViewSet(viewsets.GenericViewSet):
     @staticmethod
     def get_resource(uri, model=None):
         """
-        Resolve a resource URI to an instance of the resource.
+        Resolve a resource URI/PRN to an instance of the resource.
 
-        Provides a means to resolve an href passed in a POST body to an
+        Provides a means to resolve an href/prn passed in a POST body to an
         instance of the resource.
 
         Args:
-            uri (str): A resource URI.
+            uri (str): A resource URI/PRN.
             model (django.models.Model): A model class. If not provided, the method automatically
-                determines the used model from the resource URI.
+                determines the used model from the resource URI/PRN.
 
         Returns:
             django.models.Model: The resource fetched from the DB.
 
         Raises:
-            rest_framework.exceptions.ValidationError: on invalid URI or resource not found.
+            rest_framework.exceptions.ValidationError: on invalid URI/PRN or resource not found.
         """
-        try:
-            match = resolve(urlparse(uri).path)
-        except Resolver404:
-            raise DRFValidationError(detail=_("URI not valid: {u}").format(u=uri))
+        found_kwargs = {}
+        if uri.startswith("prn:"):
+            m, pk = resolve_prn(uri)
+            if model is None:
+                model = m
+            found_kwargs["pk"] = pk
+        else:
+            try:
+                match = resolve(urlparse(uri).path)
+            except Resolver404:
+                raise DRFValidationError(detail=_("URI not valid: {u}").format(u=uri))
+            else:
+                if model is None:
+                    model = match.func.cls.queryset.model
+                found_kwargs = match.kwargs
 
-        if model is None:
-            model = match.func.cls.queryset.model
-
-        if "pk" in match.kwargs:
-            kwargs = {"pk": match.kwargs["pk"]}
+        if "pk" in found_kwargs:
+            kwargs = {"pk": found_kwargs["pk"]}
         else:
             kwargs = {}
-            for key, value in match.kwargs.items():
+            for key, value in found_kwargs.items():
                 if key.endswith("_pk"):
                     kwargs["{}__pk".format(key[:-3])] = value
                 elif key == "pulp_domain":
                     if hasattr(model, "pulp_domain"):
                         kwargs["pulp_domain__name"] = value
+                elif key == "api_root":
+                    continue
                 else:
                     kwargs[key] = value
 
@@ -402,8 +428,8 @@ class AsyncReservedObjectMixin:
 
         .. note::
 
-          This does not work for :class:`~pulpcore.app.viewsets.AsyncCreateMixin`
-          (as there is no instance). Classes using :class:`~pulpcore.app.viewsets.AsyncCreateMixin`
+          This does not work for [pulpcore.app.viewsets.AsyncCreateMixin][]
+          (as there is no instance). Classes using [pulpcore.app.viewsets.AsyncCreateMixin][]
           must override this method.
 
         Args:
@@ -453,6 +479,8 @@ class AsyncUpdateMixin(AsyncReservedObjectMixin):
     Provides an update method that dispatches a task with reservation
     """
 
+    ALLOW_NON_BLOCKING_UPDATE = True
+
     @extend_schema(
         description="Trigger an asynchronous update task",
         responses={202: AsyncOperationResponseSerializer},
@@ -468,7 +496,7 @@ class AsyncUpdateMixin(AsyncReservedObjectMixin):
             exclusive_resources=self.async_reserved_resources(instance),
             args=(pk, app_label, serializer.__class__.__name__),
             kwargs={"data": request.data, "partial": partial},
-            immediate=True,
+            immediate=self.ALLOW_NON_BLOCKING_UPDATE,
         )
         return OperationPostponedResponse(task, request)
 
@@ -486,6 +514,8 @@ class AsyncRemoveMixin(AsyncReservedObjectMixin):
     Provides a delete method that dispatches a task with reservation
     """
 
+    ALLOW_NON_BLOCKING_DELETE = True
+
     @extend_schema(
         description="Trigger an asynchronous delete task",
         responses={202: AsyncOperationResponseSerializer},
@@ -501,13 +531,14 @@ class AsyncRemoveMixin(AsyncReservedObjectMixin):
             tasks.base.general_delete,
             exclusive_resources=self.async_reserved_resources(instance),
             args=(pk, app_label, serializer.__class__.__name__),
-            immediate=True,
+            immediate=self.ALLOW_NON_BLOCKING_DELETE,
         )
         return OperationPostponedResponse(task, request)
 
 
 class RolesMixin:
     @extend_schema(
+        summary="List roles",
         description="List roles assigned to this object.",
         responses={
             200: inline_serializer(
@@ -547,6 +578,7 @@ class RolesMixin:
         return Response(result)
 
     @extend_schema(
+        summary="Add a role",
         description="Add a role for this object to users/groups.",
         responses={201: NestedRoleSerializer},
     )
@@ -583,6 +615,7 @@ class RolesMixin:
         return Response(serializer.data, status=201)
 
     @extend_schema(
+        summary="Remove a role",
         description="Remove a role for this object from users/groups.",
         responses={201: NestedRoleSerializer},
     )
@@ -599,6 +632,7 @@ class RolesMixin:
         return Response(serializer.data, status=201)
 
     @extend_schema(
+        summary="List user permissions",
         description="List permissions available to the current user on this object.",
         responses={
             200: inline_serializer(
@@ -614,3 +648,40 @@ class RolesMixin:
             ".".join((app_label, codename)) for codename in request.user.get_all_permissions(obj)
         ]
         return Response({"permissions": permissions})
+
+
+class LabelsMixin:
+    @extend_schema(
+        summary="Set a label",
+        description="Set a single pulp_label on the object to a specific value or null.",
+    )
+    @action(detail=True, methods=["post"], serializer_class=SetLabelSerializer)
+    def set_label(self, request, pk=None):
+        obj = self.get_object()
+        serializer = SetLabelSerializer(
+            data=request.data, context={"request": request, "content_object": obj}
+        )
+        serializer.is_valid(raise_exception=True)
+        obj._meta.model.objects.filter(pk=obj.pk).update(
+            pulp_labels=RawSQL(
+                "pulp_labels || hstore(%s, %s)",
+                [serializer.validated_data["key"], serializer.validated_data["value"]],
+            )
+        )
+        return Response(serializer.data, status=201)
+
+    @extend_schema(
+        summary="Unset a label",
+        description="Unset a single pulp_label on the object.",
+    )
+    @action(detail=True, methods=["post"], serializer_class=UnsetLabelSerializer)
+    def unset_label(self, request, pk=None):
+        obj = self.get_object()
+        serializer = UnsetLabelSerializer(
+            data=request.data, context={"request": request, "content_object": obj}
+        )
+        serializer.is_valid(raise_exception=True)
+        obj._meta.model.objects.filter(pk=obj.pk).update(
+            pulp_labels=RawSQL("pulp_labels - %s::text", [serializer.validated_data["key"]])
+        )
+        return Response(serializer.data, status=201)

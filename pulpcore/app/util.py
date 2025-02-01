@@ -1,40 +1,66 @@
+import hashlib
+import zlib
+import os
+import socket
+import tempfile
+import gnupg
+
 from functools import lru_cache
 from gettext import gettext as _
-import os
-import tempfile
-
 from urllib.parse import urlparse
-
 from contextlib import ExitStack
 from contextvars import ContextVar
 from datetime import timedelta
-import gnupg
+from uuid import UUID
 
-from django.conf import settings
 from django.apps import apps
-from django.urls import Resolver404, resolve, reverse
-from django.contrib.contenttypes.models import ContentType
-from pkg_resources import get_distribution
+from django.conf import settings
+from django.db import connection
+from django.db.models import Model
+from django.urls import Resolver404, resolve
+
 from rest_framework.serializers import ValidationError
+from rest_framework.reverse import reverse as drf_reverse
 
 from pulpcore.app.loggers import deprecation_logger
 from pulpcore.app.apps import pulp_plugin_configs
 from pulpcore.app import models
+from pulpcore.exceptions import AdvisoryLockError
 from pulpcore.exceptions.validation import InvalidSignatureError
+
 
 # a little cache so viewset_for_model doesn't have to iterate over every app every time
 _model_viewset_cache = {}
+STRIPPED_API_ROOT = settings.API_ROOT.strip("/")
 
 
-def get_url(model, domain=None):
+def reverse(viewname, args=None, kwargs=None, request=None, relative_url=True, **extra):
+    """
+    Customized reverse to handle Pulp specific parameters like domains and API_ROOT rewrite.
+
+    Calls DRF's reverse, but with request as None if relative_url is True (default) so that the
+    returned url is always relative.
+    """
+    kwargs = kwargs or {}
+    if settings.DOMAIN_ENABLED:
+        kwargs.setdefault("pulp_domain", get_domain().name)
+    if settings.API_ROOT_REWRITE_HEADER:
+        kwargs.setdefault("api_root", getattr(request, "api_root", STRIPPED_API_ROOT))
+    if relative_url:
+        request = None
+    return drf_reverse(viewname, args=args, kwargs=kwargs, request=request, **extra)
+
+
+def get_url(model, domain=None, request=None):
     """
     Get a resource url for the specified model instance or class. This returns the path component of
-    the resource URI.  This is used in our resource locking/reservation code to identify resources.
+    the resource URI.
 
     Args:
         model (django.models.Model): A model instance or class.
         domain Optional(str or Domain): The domain the url should be in if DOMAIN_ENABLED is set and
         domain can not be gathered from the model. Defaults to 'default'.
+        request Optional(django.http.HttpRequest): The request object this url is being created for.
 
     Returns:
         str: The path component of the resource url
@@ -53,15 +79,93 @@ def get_url(model, domain=None):
         view_action = "detail"
         kwargs["pk"] = model.pk
 
-    return reverse(get_view_name_for_model(model, view_action), kwargs=kwargs)
+    return reverse(get_view_name_for_model(model, view_action), kwargs=kwargs, request=request)
 
 
-def extract_pk(uri):
+def get_prn(instance=None, uri=None):
     """
-    Resolve a resource URI to a simple PK value.
+    Get a Pulp Resource Name (PRN) for the specified model instance. It is similar to a HREF
+    url in that it uniquely identifies a resource, but it also has the guarantee that it will not
+    change regardless of API_ROOT or DOMAIN_ENABLED. This is used in our resource locking/
+    reservation code to identify resources.
 
-    Provides a means to resolve an href passed in a POST body to a primary key.
-    Doesn't assume anything about whether the resource corresponding to the URI
+    The format for the PRN is as follows:
+    ```
+        prn:model-label-lower:pk
+    ```
+
+    Examples:
+        instance=FileRepository(pk=123) -> prn:file.filerepository:123
+        instance=Artifact(pk=abc) -> prn:core.artifact:abc
+        uri=/rerouted/api/v3/repositories/rpm/rpm/123/versions/2/ -> prn:core.repositoryversion:abc
+        uri=/pulp/foodomain/api/v3/content/ansible/role/123/ -> prn:ansible.role:123
+
+    Args:
+        instance Optional(django.models.Model): A model instance.
+        uri Optional(str): A resource URI
+
+    Returns:
+        prn (str): The PRN of the passed in resource
+    """
+    if uri:
+        from pulpcore.app.viewsets import NamedModelViewSet
+
+        instance = NamedModelViewSet.get_resource(uri)
+
+    if not isinstance(instance, Model):
+        raise ValidationError(_("instance({}) must be a Model").format(instance))
+
+    if isinstance(instance, models.MasterModel):
+        instance = instance.cast()
+
+    return f"prn:{instance._meta.label_lower}:{instance.pk}"
+
+
+def resolve_prn(prn):
+    """
+    Resolve a PRN to its model and pk.
+
+    Args:
+        prn (str): The PRN to resolve.
+
+    Returns:
+        model_pk_tuple (tuple): A tuple of the model class and pk of the PRN
+
+    Raises:
+        rest_framework.exceptions.ValidationError: on invalid PRN.
+    """
+    if not prn.startswith("prn:"):
+        raise ValidationError(_("PRN must start with 'prn:': {}").format(prn))
+    split = prn.split(":")
+    if len(split) != 3:
+        raise ValidationError(
+            _("PRN must be of the form 'prn:app_label.model_label:pk': {}").format(prn)
+        )
+    p, full_model_label, pk = split
+    try:
+        model = apps.get_model(full_model_label)
+    except LookupError:
+        raise ValidationError(_("Model {} does not exist").format(full_model_label))
+    except ValueError:
+        raise ValidationError(
+            _("The model must be in the form of 'app_label.model_label': {}").format(
+                full_model_label
+            )
+        )
+    try:
+        UUID(pk, version=4)
+    except ValueError:
+        raise ValidationError(_("PK invalid: {}").format(pk))
+
+    return model, pk
+
+
+def extract_pk(uri, only_prn=False):
+    """
+    Resolve a resource URI or PRN to a simple PK value.
+
+    Provides a means to resolve an href/prn passed in a POST body to a primary key.
+    Doesn't assume anything about whether the resource corresponding to the URI/PRN
     passed in actually exists.
 
     Note:
@@ -70,14 +174,22 @@ def extract_pk(uri):
         RepositoryVersion PK is present within the URI.
 
     Args:
-        uri (str): A resource URI.
+        uri (str): A resource URI/PRN.
+        only_prn (bool): Ensure passed in value is only a valid PRN
 
     Returns:
-        primary_key (uuid.uuid4): The primary key of the resource extracted from the URI.
+        primary_key (uuid.uuid4): The primary key of the resource extracted from the URI/PRN.
 
     Raises:
-        rest_framework.exceptions.ValidationError: on invalid URI.
+        rest_framework.exceptions.ValidationError: on invalid URI/PRN.
     """
+    if uri.startswith("prn:"):
+        prn = uri.split(":")
+        if len(prn) != 3:
+            raise ValidationError(_("PRN not valid: {p}").format(p=prn))
+        return prn[2]
+    elif only_prn:
+        raise ValidationError(_("Not a valid PRN: {p}, must start with 'prn:'").format(p=uri))
     try:
         match = resolve(urlparse(uri).path)
     except Resolver404:
@@ -89,7 +201,11 @@ def extract_pk(uri):
         raise ValidationError("URI does not contain an unqualified resource PK")
 
 
-def raise_for_unknown_content_units(existing_content_units, content_units_pks_hrefs):
+def raise_for_unknown_content_units(
+    existing_content_units,
+    content_units_pks_hrefs,
+    domain=None,
+):
     """Verify if all the specified content units were found in the database.
 
     Args:
@@ -97,9 +213,22 @@ def raise_for_unknown_content_units(existing_content_units, content_units_pks_hr
             specified_content_units.
         content_units_pks_hrefs (dict): An original dictionary of pk-href pairs that
             are used for the verification.
+        domain (pulpcore.plugin.models.Domain): A domain to use for verifying that all the
+            content units are within the same domain. defaults to current domain.
     Raises:
-        ValidationError: If some of the referenced content units are not present in the database
+        ValidationError: If some of the referenced content units are not present in the database or
+            content units are from multiple domains
     """
+    domain = domain or get_domain()
+    bad_domain_pks = existing_content_units.exclude(pulp_domain=domain).values_list("pk", flat=True)
+    if bad_domain_pks:
+        bad_hrefs = [content_units_pks_hrefs[str(pk)] for pk in bad_domain_pks]
+        raise ValidationError(
+            _("Content units are not a part of the current domain {}: {}").format(
+                domain.name, bad_hrefs
+            )
+        )
+
     existing_content_units_pks = existing_content_units.values_list("pk", flat=True)
     existing_content_units_pks = set(map(str, existing_content_units_pks))
 
@@ -181,37 +310,26 @@ def get_view_name_for_model(model_obj, view_action):
 
 
 def batch_qs(qs, batch_size=1000):
-    """
-    Returns a queryset batch in the given queryset.
+    """Returns a queryset batch from the given queryset.
 
-    Usage:
-        # Make sure to order your querset
-        article_qs = Article.objects.order_by('id')
-        for qs in batch_qs(article_qs):
-            for article in qs:
-                print article.body
+    Make sure to order the queryset.
+
+    Args:
+       qs: The queryset we want to iterate over in batches.
+       batch_size: Defaults to 1000.
+
+    Example:
+        To iterate over a queryset while retrieving records from the DB in batches, use::
+
+            article_qs = Article.objects.order_by('id')
+            for qs in batch_qs(article_qs):
+                for article in qs:
+                    print article.body
     """
     total = qs.count()
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         yield qs[start:end]
-
-
-def get_version_from_model(in_model):
-    """
-    Return a tuple (dist-label, version) for the distribution that 'owns' the model
-
-    Args:
-        in_model (models.Model): model whose owning-plugin-version we need
-
-    Returns:
-        (str, str): tuple containing owning-plugin's (distribution, version)
-    """
-    app_label = ContentType.objects.get_for_model(in_model, for_concrete_model=False).app_label
-    app_config_module = apps.get_app_config(app_label).name
-    maybe_the_distribution_name = app_config_module.split(".")[0]
-    version = get_distribution(maybe_the_distribution_name).version  # hope for the best!
-    return maybe_the_distribution_name, version
 
 
 def get_view_urlpattern(view):
@@ -295,6 +413,35 @@ def gpg_verify(public_keys, signature, detached_data=None):
     return verified
 
 
+def compute_file_hash(filename, hasher=None, cumulative_hash=None, blocksize=8192):
+    if hasher is None:
+        hasher = hashlib.sha256()
+
+    with open(filename, "rb") as f:
+        # Read and update hash string value in blocks of 8K
+        while chunk := f.read(blocksize):
+            hasher.update(chunk)
+            if cumulative_hash:
+                cumulative_hash.update(chunk)
+        return hasher.hexdigest()
+
+
+class Crc32Hasher:
+    """Wrapper to make the CRC32 implementation act like a standard hashlib hasher"""
+
+    def __init__(self):
+        self.hashval = 0
+
+    def update(self, data):
+        self.hashval = zlib.crc32(data, self.hashval)
+
+    def digest(self):
+        return str(self.hashval)
+
+    def hexdigest(self):
+        return hex(self.hashval)[2:]
+
+
 def configure_analytics():
     task_name = "pulpcore.app.tasks.analytics.post_analytics"
     dispatch_interval = timedelta(days=1)
@@ -319,6 +466,7 @@ def configure_cleanup():
             "pulpcore.app.tasks.orphan.tmpfile_cleanup",
             settings.TMPFILE_PROTECTION_TIME,
         ),
+        ("tasks", "pulpcore.app.tasks.purge.purge", settings.TASK_PROTECTION_TIME),
     ]:
         if protection_time > 0:
             dispatch_interval = timedelta(minutes=protection_time)
@@ -328,6 +476,19 @@ def configure_cleanup():
             )
         else:
             models.TaskSchedule.objects.filter(task_name=task_name).delete()
+
+
+def configure_periodic_telemetry():
+    task_name = "pulpcore.app.tasks.telemetry.otel_metrics"
+    dispatch_interval = timedelta(minutes=5)
+    name = "Emit OpenTelemetry metrics periodically"
+
+    if settings.OTEL_ENABLED and settings.DOMAIN_ENABLED:
+        models.TaskSchedule.objects.update_or_create(
+            name=name, defaults={"task_name": task_name, "dispatch_interval": dispatch_interval}
+        )
+    else:
+        models.TaskSchedule.objects.filter(task_name=task_name).delete()
 
 
 @lru_cache(maxsize=1)
@@ -375,7 +536,7 @@ def get_artifact_url(artifact, headers=None, http_method=None):
         if settings.DOMAIN_ENABLED:
             loc = f"domain {artifact_domain.name}.storage_class"
         else:
-            loc = "settings.DEFAULT_FILE_STORAGE"
+            loc = "settings.STORAGES['default']['BACKEND']"
 
         raise NotImplementedError(
             f"The value {loc}={artifact_domain.storage_class} does not allow redirecting."
@@ -421,7 +582,9 @@ def get_default_domain():
         try:
             default_domain = Domain.objects.get(name="default")
         except Domain.DoesNotExist:
-            default_domain = Domain(name="default", storage_class=settings.DEFAULT_FILE_STORAGE)
+            default_domain = Domain(
+                name="default", storage_class=settings.STORAGES["default"]["BACKEND"]
+            )
             default_domain.save(skip_hooks=True)
 
     return default_domain
@@ -450,3 +613,52 @@ def cache_key(base_path):
             base_path = [f"{domain.name}:{path}" for path in base_path]
 
     return base_path
+
+
+@lru_cache(maxsize=1)
+def get_worker_name():
+    return f"{os.getpid()}@{socket.gethostname()}"
+
+
+class PGAdvisoryLock:
+    """
+    A context manager that will hold a postgres advisory lock non-blocking.
+
+    The locks can be chosen from a lock group to avoid collisions. They will never collide with the
+    locks used for tasks.
+    """
+
+    def __init__(self, lock, lock_group=0):
+        self.lock_group = lock_group
+        self.lock = lock
+
+    def __enter__(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", [self.lock_group, self.lock])
+            acquired = cursor.fetchone()[0]
+        if not acquired:
+            raise AdvisoryLockError("Could not acquire lock.")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [self.lock_group, self.lock])
+            released = cursor.fetchone()[0]
+        if not released:
+            raise RuntimeError("Lock not held.")
+
+
+def normalize_http_status(status):
+    """Convert the HTTP status code to 2xx, 3xx, etc., normalizing the last two digits."""
+    if 100 <= status < 200:
+        return "1xx"
+    elif 200 <= status < 300:
+        return "2xx"
+    elif 300 <= status < 400:
+        return "3xx"
+    elif 400 <= status < 500:
+        return "4xx"
+    elif 500 <= status < 600:
+        return "5xx"
+    else:
+        return ""

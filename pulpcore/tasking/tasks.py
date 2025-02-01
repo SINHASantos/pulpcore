@@ -1,24 +1,26 @@
-import logging
-from gettext import gettext as _
 import asyncio
 import contextlib
 import contextvars
 import importlib
-import traceback
+import logging
 import sys
+import traceback
+from datetime import timedelta
+from gettext import gettext as _
 
-from django.conf import settings
-from django.db import transaction, connection
-from django.db.models import Model, Q
-from django.utils import timezone
-from django_guid import get_guid, set_guid
-from django_guid.utils import generate_guid
-
+from django.db import connection, transaction
+from django.db.models import Model, Max
+from django_guid import get_guid
 from pulpcore.app.apps import MODULE_PLUGIN_VERSIONS
-from pulpcore.app.loggers import deprecation_logger
-from pulpcore.app.models import Task, TaskSchedule
-from pulpcore.app.util import get_url, get_domain, current_task
-from pulpcore.constants import TASK_FINAL_STATES, TASK_STATES, TASK_INCOMPLETE_STATES
+from pulpcore.app.models import Task, TaskGroup
+from pulpcore.app.util import current_task, get_domain, get_prn
+from pulpcore.constants import (
+    TASK_FINAL_STATES,
+    TASK_INCOMPLETE_STATES,
+    TASK_STATES,
+    TASK_DISPATCH_LOCK,
+)
+from pulpcore.tasking.kafka import send_task_notification
 
 _logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ def _validate_and_get_resources(resources):
         if isinstance(r, str):
             resource_set.add(r)
         elif isinstance(r, Model):
-            resource_set.add(get_url(r))
+            resource_set.add(get_prn(r))
         elif r is None:
             # Silently drop None values
             pass
@@ -38,7 +40,7 @@ def _validate_and_get_resources(resources):
     return list(resource_set)
 
 
-def _wakeup_worker():
+def wakeup_worker():
     # Notify workers
     with connection.connection.cursor() as cursor:
         cursor.execute("NOTIFY pulp_worker_wakeup")
@@ -53,15 +55,16 @@ def _execute_task(task):
     # Store the task id in the context for `Task.current()`.
     current_task.set(task)
     task.set_running()
+    domain = get_domain()
     try:
-        _logger.info(_("Starting task %s"), task.pk)
+        _logger.info(_("Starting task %s in domain: %s"), task.pk, domain.name)
 
         # Execute task
         module_name, function_name = task.name.rsplit(".", 1)
         module = importlib.import_module(module_name)
         func = getattr(module, function_name)
-        args = task.args or ()
-        kwargs = task.kwargs or {}
+        args = task.enc_args or ()
+        kwargs = task.enc_kwargs or {}
         result = func(*args, **kwargs)
         if asyncio.iscoroutine(result):
             _logger.debug(_("Task is coroutine %s"), task.pk)
@@ -71,11 +74,21 @@ def _execute_task(task):
     except Exception:
         exc_type, exc, tb = sys.exc_info()
         task.set_failed(exc, tb)
-        _logger.info(_("Task %s failed (%s)"), task.pk, exc)
+        _logger.info(
+            _("Task[{task_type}] {task_pk} failed ({exc_type}: {exc}) in domain: {domain}").format(
+                task_type=task.name,
+                task_pk=task.pk,
+                exc_type=exc_type.__name__,
+                exc=exc,
+                domain=domain.name,
+            )
+        )
         _logger.info("\n".join(traceback.format_list(traceback.extract_tb(tb))))
+        send_task_notification(task)
     else:
         task.set_completed()
-        _logger.info(_("Task completed %s"), task.pk)
+        _logger.info(_("Task completed %s in domain: %s"), task.pk, domain.name)
+        send_task_notification(task)
 
 
 def dispatch(
@@ -96,7 +109,7 @@ def dispatch(
     serialized urls. No two tasks that claim the same resource can execute concurrently. It
     accepts resources which it transforms into a list of urls (one for each resource).
 
-    This method creates a :class:`pulpcore.app.models.Task` object and returns it.
+    This method creates a [pulpcore.app.models.Task][] object and returns it.
 
     The values in `args` and `kwargs` must be JSON serializable, but may contain instances of
     ``uuid.UUID``.
@@ -133,17 +146,7 @@ def dispatch(
         function_name = func
 
     if versions is None:
-        try:
-            versions = MODULE_PLUGIN_VERSIONS[function_name.split(".", maxsplit=1)[0]]
-        except KeyError:
-            deprecation_logger.warn(
-                _(
-                    "Using functions outside of pulp components as tasks is not supported and will "
-                    "result in runtime errors with pulpcore>=3.40."
-                )
-            )
-            # The best we can do now...
-            versions = MODULE_PLUGIN_VERSIONS["pulpcore"]
+        versions = MODULE_PLUGIN_VERSIONS[function_name.split(".", maxsplit=1)[0]]
 
     if exclusive_resources is None:
         exclusive_resources = []
@@ -153,26 +156,53 @@ def dispatch(
         shared_resources = []
     else:
         shared_resources = _validate_and_get_resources(shared_resources)
-    if settings.DOMAIN_ENABLED:
-        domain_url = get_url(get_domain())
-        if domain_url not in exclusive_resources:
-            shared_resources.append(domain_url)
+
+    # A task that is exclusive on a domain will block all tasks within that domain
+    domain_prn = get_prn(get_domain())
+    if domain_prn not in exclusive_resources:
+        shared_resources.append(domain_prn)
     resources = exclusive_resources + [f"shared:{resource}" for resource in shared_resources]
 
     notify_workers = False
     with contextlib.ExitStack() as stack:
         with transaction.atomic():
+            # Task creation need to be serialized so that pulp_created will provide a stable order
+            # at every time. We specifically need to ensure that each task, when commited to the
+            # task table will be the newest with respect to `pulp_created`.
+            with connection.cursor() as cursor:
+                # Wait for exclusive access and release automatically after transaction.
+                cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", [0, TASK_DISPATCH_LOCK])
+            newest_created = Task.objects.aggregate(Max("pulp_created"))["pulp_created__max"]
             task = Task.objects.create(
                 state=TASK_STATES.WAITING,
                 logging_cid=(get_guid()),
                 task_group=task_group,
                 name=function_name,
-                args=args,
-                kwargs=kwargs,
+                enc_args=args,
+                enc_kwargs=kwargs,
                 parent_task=Task.current(),
                 reserved_resources_record=resources,
                 versions=versions,
+                immediate=immediate,
+                deferred=deferred,
             )
+            if newest_created and task.pulp_created <= newest_created:
+                # Let this workaround not row forever into the future.
+                if newest_created - task.pulp_created > timedelta(seconds=1):
+                    # Do not commit the transaction if this condition is not met.
+                    # If we ever hit this, think about delegating the timestamping to PostgresQL.
+                    raise RuntimeError("Clockscrew detected. Task dispatching would be dangerous.")
+                # Try to work around the smaller glitch
+                task.pulp_created = newest_created + timedelta(milliseconds=1)
+                task.save()
+            if task_group:
+                task_group.refresh_from_db()
+                if task_group.all_tasks_dispatched:
+                    task.set_canceling()
+                    task.set_canceled(
+                        TASK_STATES.CANCELED, "All tasks in group have been dispatched/canceled."
+                    )
+                    return task
             if immediate:
                 # Grab the advisory lock before the task hits the db.
                 stack.enter_context(task)
@@ -195,6 +225,7 @@ def dispatch(
                     reserved_resources_record__overlap=colliding_resources
                 ).exists()
             ):
+                task.unblock()
                 execute_task(task)
                 if resources:
                     notify_workers = True
@@ -204,41 +235,67 @@ def dispatch(
                 task.set_canceling()
                 task.set_canceled(TASK_STATES.CANCELED, "Resources temporarily unavailable.")
     if notify_workers:
-        _wakeup_worker()
+        wakeup_worker()
     return task
 
 
-def dispatch_scheduled_tasks():
-    # Warning, dispatch_scheduled_tasks is not race condition free!
-    now = timezone.now()
-    # Dispatch all tasks old enough and not still running
-    for task_schedule in TaskSchedule.objects.filter(next_dispatch__lte=now).filter(
-        Q(last_task=None) | Q(last_task__state__in=TASK_FINAL_STATES)
-    ):
-        try:
-            if task_schedule.dispatch_interval is None:
-                # This was a timed one shot task schedule
-                task_schedule.next_dispatch = None
-            else:
-                # This is a recurring task schedule
-                while task_schedule.next_dispatch < now:
-                    # Do not schedule in the past
-                    task_schedule.next_dispatch += task_schedule.dispatch_interval
-            set_guid(generate_guid())
-            with transaction.atomic():
-                task_schedule.last_task = dispatch(
-                    task_schedule.task_name,
-                )
-                task_schedule.save(update_fields=["next_dispatch", "last_task"])
+def cancel_task(task_id):
+    """
+    Cancel the task that is represented by the given task_id.
 
-            _logger.info(
-                "Dispatched scheduled task {task_name} as task id {task_id}".format(
-                    task_name=task_schedule.task_name, task_id=task_schedule.last_task.pk
-                )
+    This method cancels only the task with given task_id, not the spawned tasks. This also updates
+    task's state to 'canceling'.
+
+    Args:
+        task_id (str): The ID of the task you wish to cancel
+
+    Raises:
+        rest_framework.exceptions.NotFound: If a task with given task_id does not exist
+    """
+    task = Task.objects.select_related("pulp_domain").get(pk=task_id)
+
+    if task.state in TASK_FINAL_STATES:
+        # If the task is already done, just stop
+        _logger.debug(
+            "Task [{task_id}] in domain: {name} already in a final state: {state}".format(
+                task_id=task_id, name=task.pulp_domain.name, state=task.state
             )
-        except Exception as e:
-            _logger.warning(
-                "Dispatching scheduled task {task_name} failed. {error}".format(
-                    task_name=task_schedule.task_name, error=str(e)
-                )
-            )
+        )
+        return task
+    _logger.info(
+        _("Canceling task: {id} in domain: {name}").format(id=task_id, name=task.pulp_domain.name)
+    )
+
+    # This is the only valid transition without holding the task lock
+    task.set_canceling()
+    # Notify the worker that might be running that task and other workers to clean up
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_notify('pulp_worker_cancel', %s)", (str(task.pk),))
+        cursor.execute("NOTIFY pulp_worker_wakeup")
+    return task
+
+
+def cancel_task_group(task_group_id):
+    """
+    Cancel the task group that is represented by the given task_group_id.
+
+    This method attempts to cancel all tasks in the task group.
+
+    Args:
+        task_group_id (str): The ID of the task group you wish to cancel
+
+    Raises:
+        TaskGroup.DoesNotExist: If a task group with given task_group_id does not exist
+    """
+    task_group = TaskGroup.objects.get(pk=task_group_id)
+    task_group.all_tasks_dispatched = True
+    task_group.save(update_fields=["all_tasks_dispatched"])
+
+    TASK_RUNNING_STATES = (TASK_STATES.RUNNING, TASK_STATES.WAITING)
+    tasks = task_group.tasks.filter(state__in=TASK_RUNNING_STATES).values_list("pk", flat=True)
+    for task_id in tasks:
+        try:
+            cancel_task(task_id)
+        except RuntimeError:
+            pass
+    return task_group

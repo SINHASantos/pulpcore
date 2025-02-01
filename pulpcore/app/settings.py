@@ -2,10 +2,10 @@
 Django settings for the Pulp Platform application
 
 Never import this module directly, instead `from django.conf import settings`, see
-https://docs.djangoproject.com/en/3.2/topics/settings/#using-settings-in-python-code
+<https://docs.djangoproject.com/en/3.2/topics/settings/#using-settings-in-python-code>
 
 For the full list of settings and their values, see
-https://docs.djangoproject.com/en/3.2/ref/settings/
+<https://docs.djangoproject.com/en/3.2/ref/settings/>
 """
 
 import sys
@@ -14,13 +14,29 @@ from contextlib import suppress
 from importlib import import_module
 from logging import getLogger
 from pathlib import Path
-from pkg_resources import iter_entry_points
 
 from cryptography.fernet import Fernet
+from django.core.files.storage import storages
+from django.conf import global_settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
 
 from pulpcore import constants
+
+
+try:
+    import sentry_sdk
+
+    sentry_sdk.init()
+except ImportError:
+    pass
+
+if sys.version_info < (3, 10):
+    # Python 3.9 has a rather different interface for `entry_points`.
+    # Let's use a compatibility version.
+    from importlib_metadata import entry_points
+else:
+    from importlib.metadata import entry_points
 
 # Build paths inside the project like this: BASE_DIR / ...
 BASE_DIR = Path(__file__).absolute().parent
@@ -42,7 +58,28 @@ MEDIA_ROOT = str(DEPLOY_ROOT / "media")  # Django 3.1 adds support for pathlib.P
 STATIC_URL = "/assets/"
 STATIC_ROOT = DEPLOY_ROOT / STATIC_URL.strip("/")
 
-DEFAULT_FILE_STORAGE = "pulpcore.app.models.storage.FileSystem"
+# begin compatilibity layer for DEFAULT_FILE_STORAGE
+# Remove on pulpcore=3.85 or pulpcore=4.0
+
+# - What is this?
+# We shouldnt use STORAGES or DEFAULT_FILE_STORAGE directly because those are
+# mutually exclusive by django, which constraints users to use whatever we use.
+# This is a hack/workaround to set Pulp's default while still enabling users to choose
+# the legacy or the new storage setting.
+_DEFAULT_FILE_STORAGE = "pulpcore.app.models.storage.FileSystem"
+_STORAGES = {
+    "default": {
+        "BACKEND": "pulpcore.app.models.storage.FileSystem",
+    },
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}
+
+setattr(global_settings, "DEFAULT_FILE_STORAGE", _DEFAULT_FILE_STORAGE)
+setattr(global_settings, "STORAGES", _STORAGES)
+# end DEFAULT_FILE_STORAGE deprecation layer
+
 REDIRECT_TO_OBJECT_STORAGE = True
 
 WORKING_DIRECTORY = DEPLOY_ROOT / "tmp"
@@ -53,13 +90,15 @@ CHUNKED_UPLOAD_DIR = "upload"
 # List of upload handler classes to be applied in order.
 FILE_UPLOAD_HANDLERS = ("pulpcore.app.files.HashingFileUploadHandler",)
 
-SECRET_KEY = True
+# SECURITY WARNING: this should be set to a unique, unpredictable value
+SECRET_KEY = "SECRET"
 
 # Key used to encrypt fields in the database
 DB_ENCRYPTION_KEY = "/etc/pulp/certs/database_fields.symmetric.key"
 
 # API Root
 API_ROOT = "/pulp/"
+API_ROOT_REWRITE_HEADER = None
 
 # Application definition
 
@@ -84,9 +123,9 @@ INSTALLED_APPS = [
 # Enumerate the installed Pulp plugins during the loading process for use in the status API
 INSTALLED_PULP_PLUGINS = []
 
-for entry_point in iter_entry_points("pulpcore.plugin"):
+for entry_point in entry_points(group="pulpcore.plugin"):
     plugin_app_config = entry_point.load()
-    INSTALLED_PULP_PLUGINS.append(entry_point.module_name)
+    INSTALLED_PULP_PLUGINS.append(entry_point.name)
     INSTALLED_APPS.append(plugin_app_config)
 
 # Optional apps that help with development, or augment Pulp in some non-critical way
@@ -113,6 +152,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "pulpcore.middleware.DomainMiddleware",
+    "pulpcore.middleware.APIRootRewriteMiddleware",
 ]
 
 AUTHENTICATION_BACKENDS = [
@@ -145,9 +185,9 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": ("pulpcore.filters.PulpFilterBackend",),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
     "PAGE_SIZE": 100,
-    "DEFAULT_PERMISSION_CLASSES": ("pulpcore.plugin.access_policy.AccessPolicyFromDB",),
+    "DEFAULT_PERMISSION_CLASSES": ("pulpcore.app.access_policy.AccessPolicyFromDB",),
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework.authentication.BasicAuthentication",
+        "pulpcore.app.authentication.BasicAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ),
     "UPLOADED_FILES_USE_URL": False,
@@ -202,6 +242,11 @@ REDIS_PASSWORD = None
 REDIS_SSL = False
 REDIS_SSL_CA_CERTS = None
 
+# Social_django settings
+SOCIAL_AUTH_URL_NAMESPACE = "social"
+SOCIAL_AUTH_POSTGRES_JSONFIELD = True
+SOCIAL_AUTH_JSONFIELD_CUSTOM = "django.db.models.JSONField"
+
 # https://docs.djangoproject.com/en/3.2/ref/settings/#logging and
 # https://docs.python.org/3/library/logging.config.html
 LOGGING = {
@@ -233,29 +278,49 @@ LOGGING = {
     },
 }
 
+# Custom access policies indexed by the url_pattern of the view.
+# This will only take effect when combined with the
+# `pulpcore.app.access_policy.AccessPoliciesFromSettings` permission class.
+ACCESS_POLICIES = {}
+
 DRF_ACCESS_POLICY = {"reusable_conditions": ["pulpcore.app.global_access_conditions"]}
 
+CONTENT_ORIGIN = None
 CONTENT_PATH_PREFIX = "/pulp/content/"
-CONTENT_APP_TTL = 30
 
+API_APP_TTL = 120  # The heartbeat is called from gunicorn notify (defaulting to 45 sec).
+CONTENT_APP_TTL = 30
 WORKER_TTL = 30
 
 # how long to protect ephemeral items in minutes
 ORPHAN_PROTECTION_TIME = 24 * 60
+
+# Custom cleaup intervals
+# for the following, if set to 0, the corresponding cleanup task is disabled
 UPLOAD_PROTECTION_TIME = 0
+TASK_PROTECTION_TIME = 0
 TMPFILE_PROTECTION_TIME = 0
 
 REMOTE_USER_ENVIRON_NAME = "REMOTE_USER"
+
+AUTHENTICATION_JSON_HEADER = ""
+AUTHENTICATION_JSON_HEADER_JQ_FILTER = ""
+AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME = {}
 
 ALLOWED_IMPORT_PATHS = []
 
 ALLOWED_EXPORT_PATHS = []
 
-# https://docs.pulpproject.org/pulpcore/configuration/settings.html#pulp-cache
+# https://pulpproject.org/pulpcore/docs/admin/reference/settings/?h=settings#cache_enabled
 CACHE_ENABLED = False
 CACHE_SETTINGS = {
     "EXPIRES_TTL": 600,  # 10 minutes
 }
+
+# The time a RemoteArtifact will be ignored after failure.
+# In on-demand, if a fetching content from a remote failed due to corrupt data,
+# the corresponding RemoteArtifact will be ignored for that time (seconds).
+REMOTE_CONTENT_FETCH_FAILURE_COOLDOWN = 5 * 60  # 5 minutes
 
 SPECTACULAR_SETTINGS = {
     "SERVE_URLCONF": ROOT_URLCONF,
@@ -266,6 +331,10 @@ SPECTACULAR_SETTINGS = {
     "COMPONENT_NO_READ_ONLY_REQUIRED": True,
     "GENERIC_ADDITIONAL_PROPERTIES": None,
     "DISABLE_ERRORS_AND_WARNINGS": not DEBUG,
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.hooks.postprocess_schema_enums",
+        "pulpcore.openapi.hooks.add_info_hook",
+    ],
     "TITLE": "Pulp 3 API",
     "DESCRIPTION": "Fetch, Upload, Organize, and Distribute Software Packages",
     "VERSION": "v3",
@@ -298,36 +367,44 @@ DOMAIN_ENABLED = False
 
 SHELL_PLUS_IMPORTS = [
     "from pulpcore.app.util import get_domain, get_domain_pk, set_domain, get_url, extract_pk",
-    "from pulpcore.tasking.tasks import dispatch",
-    "from pulpcore.tasking.util import cancel_task",
+    "from pulpcore.tasking.tasks import dispatch, cancel_task, wakeup_worker",
 ]
 
+# What percentage of available-workers will pulpimport use at a time, max
+# By default, use all available workers.
+IMPORT_WORKERS_PERCENT = 100
+
+# Kafka settings
+KAFKA_BOOTSTRAP_SERVERS = None  # kafka integration disabled by default
+KAFKA_TASKS_STATUS_TOPIC = "pulpcore.tasking.status"
+KAFKA_TASKS_STATUS_PRODUCER_SYNC_ENABLED = False
+KAFKA_PRODUCER_POLL_TIMEOUT = 0.1
+KAFKA_SECURITY_PROTOCOL = "plaintext"
+KAFKA_SSL_CA_PEM = None
+KAFKA_SASL_MECHANISM = None
+KAFKA_SASL_USERNAME = None
+KAFKA_SASL_PASSWORD = None
+
+# opentelemetry settings
+OTEL_ENABLED = False
+
 # HERE STARTS DYNACONF EXTENSION LOAD (Keep at the very bottom of settings.py)
-# Read more at https://dynaconf.readthedocs.io/en/latest/guides/django.html
+# Read more at https://www.dynaconf.com/django/
 from dynaconf import DjangoDynaconf, Validator  # noqa
 
 # Validators
-content_origin_validator = Validator(
-    "CONTENT_ORIGIN",
-    must_exist=True,
-    messages={
-        "must_exist_true": (
-            "CONTENT_ORIGIN is a required setting but it was not configured. This may be caused "
-            "by invalid read permissions of the settings file. Note that CONTENT_ORIGIN is set by "
-            "the installation automatically."
-        )
-    },
-)
+storage_keys = ("STORAGES.default.BACKEND", "DEFAULT_FILE_STORAGE")
 storage_validator = (
     Validator("REDIRECT_TO_OBJECT_STORAGE", eq=False)
-    | Validator("DEFAULT_FILE_STORAGE", eq="pulpcore.app.models.storage.FileSystem")
-    | Validator("DEFAULT_FILE_STORAGE", eq="storages.backends.azure_storage.AzureStorage")
-    | Validator("DEFAULT_FILE_STORAGE", eq="storages.backends.s3boto3.S3Boto3Storage")
-    | Validator("DEFAULT_FILE_STORAGE", eq="storages.backends.gcloud.GoogleCloudStorage")
+    | Validator(*storage_keys, eq="pulpcore.app.models.storage.FileSystem")
+    | Validator(*storage_keys, eq="storages.backends.azure_storage.AzureStorage")
+    | Validator(*storage_keys, eq="storages.backends.s3boto3.S3Boto3Storage")
+    | Validator(*storage_keys, eq="storages.backends.gcloud.GoogleCloudStorage")
 )
 storage_validator.messages["combined"] = (
-    "'REDIRECT_TO_OBJECT_STORAGE=True' is only supported with the local file, S3, GCP or Azure"
-    "storage backend configured in DEFAULT_FILE_STORAGE."
+    "'REDIRECT_TO_OBJECT_STORAGE=True' is only supported with the local file, S3, GCP or Azure "
+    "storage backend configured in STORAGES['default']['BACKEND'] "
+    "(deprecated DEFAULT_FILE_STORAGE)."
 )
 
 cache_enabled_validator = Validator("CACHE_ENABLED", eq=True)
@@ -337,7 +414,7 @@ redis_port_validator = Validator("REDIS_PORT", must_exist=True, when=cache_enabl
 cache_validator = redis_url_validator | (redis_host_validator & redis_port_validator)
 cache_validator.messages["combined"] = (
     "CACHE_ENABLED is enabled but it requires to have REDIS configured. Please check "
-    "https://docs.pulpproject.org/pulpcore/configuration/settings.html#redis-settings "
+    "https://pulpproject.org/pulpcore/docs/admin/reference/settings/?h=settings#redis-settings "
     "for more information."
 )
 
@@ -369,6 +446,48 @@ api_root_validator = Validator(
     },
 )
 
+json_header_auth_class_restframework_validator = Validator(
+    "REST_FRAMEWORK__DEFAULT_AUTHENTICATION_CLASSES",
+    cont="pulpcore.app.authentication.JSONHeaderRemoteAuthentication",
+)
+
+authentication_json_header_validator = Validator(
+    "AUTHENTICATION_JSON_HEADER",
+    startswith="HTTP_",
+    must_exist=True,
+    when=json_header_auth_class_restframework_validator,
+    messages={"startswith": 'The AUTHENTICATION_JSON_HEADER must start with "HTTP_"'},
+)
+
+authentication_json_header_jq_filter_validator = Validator(
+    "AUTHENTICATION_JSON_HEADER_JQ_FILTER",
+    startswith=".",
+    must_exist=True,
+    when=json_header_auth_class_restframework_validator,
+    messages={"startswith": 'The AUTHENTICATION_JSON_HEADER_JQ_FILTER must start with "."'},
+)
+
+json_header_auth_validator = (
+    authentication_json_header_validator & authentication_json_header_jq_filter_validator
+)
+
+authentication_json_header_openapi_security_scheme_setting_validator = Validator(
+    "AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME", len_min=1
+)
+authentication_json_header_openapi_security_scheme_validator = Validator(
+    "AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME",
+    when=authentication_json_header_openapi_security_scheme_setting_validator,
+    is_type_of=dict,
+    messages={"is_type_of": "{name} must be a dictionary."},
+)
+
+
+def otel_middleware_hook(settings):
+    data = {"dynaconf_merge": True}
+    if settings.OTEL_ENABLED:
+        data["MIDDLEWARE"] = ["pulpcore.middleware.DjangoMetricsMiddleware"]
+    return data
+
 
 settings = DjangoDynaconf(
     __name__,
@@ -382,21 +501,29 @@ settings = DjangoDynaconf(
     validators=[
         api_root_validator,
         cache_validator,
-        content_origin_validator,
         sha256_validator,
         storage_validator,
         unknown_algs_validator,
+        json_header_auth_validator,
+        authentication_json_header_openapi_security_scheme_validator,
     ],
+    post_hooks=otel_middleware_hook,
 )
-# HERE ENDS DYNACONF EXTENSION LOAD (No more code below this line)
+
+# begin compatilibity layer for DEFAULT_FILE_STORAGE
+# Remove on pulpcore=3.85 or pulpcore=4.0
+
+# Ensures the cached property storage.backends uses the the right value
+storages._backends = settings.STORAGES.copy()
+storages.backends
+# end compatibility layer
 
 _logger = getLogger(__name__)
 
 
 if not (
-    Path(sys.argv[0]).name == "pytest"
-    or Path(sys.argv[0]).name == "sphinx-build"
-    or (len(sys.argv) >= 2 and sys.argv[1] == "collectstatic")
+    Path(sys.argv[0]).name in ["pytest", "sphinx-build"]
+    or (len(sys.argv) >= 2 and sys.argv[1] in ["collectstatic", "openapi"])
 ):
     try:
         with open(DB_ENCRYPTION_KEY, "rb") as key_file:
@@ -413,7 +540,12 @@ FORBIDDEN_CHECKSUMS = set(constants.ALL_KNOWN_CONTENT_CHECKSUMS).difference(
     ALLOWED_CONTENT_CHECKSUMS
 )
 
-_SKIPPED_COMMANDS_FOR_CONTENT_CHECKS = ["handle-artifact-checksums", "migrate", "collectstatic"]
+_SKIPPED_COMMANDS_FOR_CONTENT_CHECKS = [
+    "handle-artifact-checksums",
+    "migrate",
+    "collectstatic",
+    "openapi",
+]
 
 if not (len(sys.argv) >= 2 and sys.argv[1] in _SKIPPED_COMMANDS_FOR_CONTENT_CHECKS):
     try:
@@ -471,7 +603,11 @@ if not (len(sys.argv) >= 2 and sys.argv[1] in _SKIPPED_COMMANDS_FOR_CONTENT_CHEC
     finally:
         connection.close()
 
-settings.set("V3_API_ROOT", settings.API_ROOT + "api/v3/")  # Not user configurable
-settings.set("V3_DOMAIN_API_ROOT", settings.API_ROOT + "<slug:pulp_domain>/api/v3/")
+if settings.API_ROOT_REWRITE_HEADER:
+    api_root = "/<path:api_root>/"
+else:
+    api_root = settings.API_ROOT
+settings.set("V3_API_ROOT", api_root + "api/v3/")  # Not user configurable
+settings.set("V3_DOMAIN_API_ROOT", api_root + "<slug:pulp_domain>/api/v3/")
 settings.set("V3_API_ROOT_NO_FRONT_SLASH", settings.V3_API_ROOT.lstrip("/"))
 settings.set("V3_DOMAIN_API_ROOT_NO_FRONT_SLASH", settings.V3_DOMAIN_API_ROOT.lstrip("/"))

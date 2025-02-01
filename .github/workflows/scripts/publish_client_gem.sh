@@ -12,27 +12,19 @@ set -euv
 # make sure this script runs at the repo root
 cd "$(dirname "$(realpath -e "$0")")"/../../..
 
+VERSION="$1"
 
-mkdir ~/.gem || true
+if [[ -z "${VERSION}" ]]
+then
+  echo "No version specified."
+  exit 1
+fi
+
+mkdir -p ~/.gem
 touch ~/.gem/credentials
 echo "---
-:rubygems_api_key: $RUBYGEMS_API_KEY" > ~/.gem/credentials
+:rubygems_api_key: ${RUBYGEMS_API_KEY}" > ~/.gem/credentials
 sudo chmod 600 ~/.gem/credentials
-
-export VERSION=$(ls pulpcore_client* | sed -rn 's/pulpcore_client-(.*)\.gem/\1/p')
-
-if [[ -z "$VERSION" ]]; then
-  echo "No client package found."
-  exit
-fi
-
-export response=$(curl --write-out %{http_code} --silent --output /dev/null https://rubygems.org/gems/pulpcore_client/versions/$VERSION)
-
-if [ "$response" == "200" ];
-then
-  echo "pulpcore client $VERSION has already been released. Skipping."
-  exit
-fi
-
-GEM_FILE="$(ls pulpcore_client-*)"
-gem push ${GEM_FILE}
+gem push "pulpcore_client-${VERSION}.gem"
+gem push "pulp_file_client-${VERSION}.gem"
+gem push "pulp_certguard_client-${VERSION}.gem"

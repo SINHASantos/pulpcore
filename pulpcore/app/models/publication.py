@@ -1,7 +1,14 @@
 import hashlib
+import json
+import jq
+import logging
 import os
 import re
+
+from base64 import b64decode
+from binascii import Error as Base64DecodeError
 from datetime import timedelta
+from gettext import gettext as _
 from url_normalize import url_normalize
 from urllib.parse import urlparse, urljoin
 
@@ -22,7 +29,10 @@ from pulpcore.cache import Cache
 from rest_framework.exceptions import APIException
 from pulpcore.app.models import AutoAddObjPermsMixin
 from pulpcore.responses import ArtifactResponse
-from pulpcore.app.util import get_domain_pk, cache_key
+from pulpcore.app.util import get_domain_pk, cache_key, get_url
+
+
+_logger = logging.getLogger(__name__)
 
 
 class PublicationQuerySet(models.QuerySet):
@@ -141,33 +151,29 @@ class Publication(MasterModel):
         Notes:
             Deletes the Task.created_resource when complete is False.
         """
+        # invalidate cache
+        if settings.CACHE_ENABLED:
+            # Find any publications being served directly
+            base_paths = self.distribution_set.values_list("base_path", flat=True)
+            # Find any publications being served indirectly by auto-distribute feature
+            # It's possible for errors to occur before any publication has been completed,
+            # so we need to handle the case when no Publication exists.
+            try:
+                versions = self.repository.versions.all()
+                pubs = Publication.objects.filter(repository_version__in=versions, complete=True)
+                publication = pubs.latest("repository_version", "pulp_created")
+                if self.pk == publication.pk:
+                    base_paths |= self.repository.distributions.values_list("base_path", flat=True)
+            except Publication.DoesNotExist:
+                pass
+
+            # Invalidate cache for all distributions serving this publication
+            if base_paths:
+                Cache().delete(base_key=cache_key(base_paths))
+
         with transaction.atomic():
-            # invalidate cache
-            if settings.CACHE_ENABLED:
-                # Find any publications being served directly
-                base_paths = self.distribution_set.values_list("base_path", flat=True)
-                # Find any publications being served indirectly by auto-distribute feature
-                # It's possible for errors to occur before any publication has been completed,
-                # so we need to handle the case when no Publication exists.
-                try:
-                    versions = self.repository.versions.all()
-                    pubs = Publication.objects.filter(
-                        repository_version__in=versions, complete=True
-                    )
-                    publication = pubs.latest("repository_version", "pulp_created")
-                    if self.pk == publication.pk:
-                        base_paths |= self.repository.distributions.values_list(
-                            "base_path", flat=True
-                        )
-                except Publication.DoesNotExist:
-                    pass
-
-                # Invalidate cache for all distributions serving this publication
-                if base_paths:
-                    Cache().delete(base_key=cache_key(base_paths))
-
             CreatedResource.objects.filter(object_id=self.pk).delete()
-            super().delete(**kwargs)
+            return super().delete(**kwargs)
 
     def finalize_new_publication(self):
         """
@@ -316,7 +322,7 @@ class ContentGuard(MasterModel):
     plugin-specific persistent attributes and additional validation for those attributes.
     The permit() method must be overridden to provide the web request authorization logic.
 
-    This object is a Django model that inherits from :class: `pulpcore.app.models.ContentGuard`
+    This object is a Django model that inherits from [pulpcore.app.models.ContentGuard][]
     which provides the platform persistent attributes for a content-guard. Plugin authors can
     add additional persistent attributes by subclassing this class and adding Django fields.
     We defer to the Django docs on extending this model definition with additional fields.
@@ -452,6 +458,111 @@ class ContentRedirectContentGuard(ContentGuard, AutoAddObjPermsMixin):
             (
                 "manage_roles_contentredirectcontentguard",
                 "Can manage role assignments on Redirect content guard",
+            ),
+        )
+
+
+class HeaderContentGuard(ContentGuard, AutoAddObjPermsMixin):
+    """
+    Content guard to protect content based on a header value.
+    """
+
+    TYPE = "header"
+
+    header_name = models.TextField()
+    header_value = models.TextField()
+    jq_filter = models.TextField(null=True)
+
+    def permit(self, request):
+        header_content = request.headers.get(self.header_name)
+        if not header_content:
+            _logger.debug(
+                "Access not allowed. Header {header_name} not found.".format(
+                    header_name=self.header_name
+                )
+            )
+            raise PermissionError(_("Access denied."))
+
+        try:
+            header_decoded_content = b64decode(header_content)
+        except Base64DecodeError:
+            _logger.debug("Access not allowed - Header content is not Base64 encoded.")
+            raise PermissionError(_("Access denied."))
+
+        if self.jq_filter:
+            try:
+                header_value = json.loads(header_decoded_content)
+                json_path = jq.compile(self.jq_filter)
+
+                header_value = json_path.input_value(header_value).first()
+
+            except json.JSONDecodeError:
+                _logger.debug("Access not allowed - Invalid JSON or Path not found.")
+                raise PermissionError(_("Access denied."))
+        else:
+            header_value = header_decoded_content.decode("utf8")
+
+        if header_value != self.header_value:
+            _logger.debug("Access not allowed - Wrong header value.")
+            raise PermissionError(_("Access denied."))
+
+        return
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        permissions = (
+            (
+                "manage_roles_headercontentguard",
+                "Can manage role assignments on header content guard",
+            ),
+        )
+
+
+class CompositeContentGuard(ContentGuard, AutoAddObjPermsMixin):
+    """
+    Content guard to allow a list of contentguards to be evaluated on access.
+
+    Content-guards in the `guards` list have their permit() calls issued in order. At the
+    first "pass" result, access is permitted. Only if ALL guards in the list forbid access,
+    is access forbidden.
+
+    guards (django.db.models.ManyToManyField): ContentGuards to invoke.
+    """
+
+    TYPE = "composite"
+
+    guards = models.ManyToManyField(ContentGuard, related_name="+", symmetrical=False)
+
+    def permit(self, request):
+        """
+        Permit if ANY content-guard allows (OR permissions).
+        """
+        errors = []
+        if not self.guards.all():
+            # No guards specified? PASS
+            return
+
+        for guard in self.guards.all():
+            detail_guard = guard.cast()
+            try:
+                detail_guard.permit(request)
+                return  # success on first-pass
+            except PermissionError as pe:
+                guard_error = _("Guard: '{}', HREF: '{}', class: '{}', denial: [{}].").format(
+                    detail_guard.name, get_url(detail_guard), type(detail_guard), str(pe)
+                )
+                errors.append(guard_error)
+
+        # If we get here - FAIL
+        msg = _("Access forbidden. Refusals: {}").format(errors)
+        raise PermissionError(msg)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        permissions = (
+            (
+                "manage_roles_compositecontentguard",
+                "Can manage role assignments on Composite content guard",
             ),
         )
 
@@ -617,7 +728,12 @@ class ArtifactDistribution(Distribution):
             raise RuntimeError(f"This system already has a {cls.__name__}")
 
     def artifact_url(self, artifact):
-        origin = settings.CONTENT_ORIGIN.strip("/")
+
+        # When CONTENT_ORIGIN == None we need to set origin as "/" so that the base_url will
+        # have the relative path like "/some/file/path", instead of "some/file/path"
+        origin = "/"
+        if settings.CONTENT_ORIGIN:
+            origin = settings.CONTENT_ORIGIN.strip("/")
         prefix = settings.CONTENT_PATH_PREFIX.strip("/")
         base_path = self.base_path.strip("/")
         if settings.DOMAIN_ENABLED:

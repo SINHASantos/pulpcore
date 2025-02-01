@@ -22,7 +22,7 @@ class PulpException(Exception):
         """
         Returns the string representation of the exception.
 
-        Each concrete class that inherits from :class: `pulpcore.server.exception.PulpException` is
+        Each concrete class that inherits from [pulpcore.server.exception.PulpException][] is
         expected to implement it's own __str__() method. The return value is used by Pulp when
         recording the exception in the database.
         """
@@ -85,3 +85,16 @@ class TimeoutException(PulpException):
         return _(
             "Request timed out for {}. Increasing the total_timeout value on the remote might help."
         ).format(self.url)
+
+
+class DomainProtectedError(PulpException):
+    """
+    Exception to signal that a domain the user is trying to delete still contains
+    repositories with content.
+    """
+
+    def __init__(self):
+        super().__init__("PLP0007")
+
+    def __str__(self):
+        return _("You cannot delete a domain that still contains repositories with content.")

@@ -1,21 +1,32 @@
 """
 This module contains custom filters that might be used by more than one ViewSet.
 """
+
 import re
 
 from collections import defaultdict
 from itertools import chain
 from gettext import gettext as _
-from urllib.parse import urlparse
 
-from django.urls import Resolver404, resolve
+from django.conf import settings
 from django.db.models import ObjectDoesNotExist
 from django_filters import BaseInFilter, CharFilter, Filter
 from rest_framework import serializers
 from rest_framework.serializers import ValidationError as DRFValidationError
 
-from pulpcore.app.models import ContentArtifact, RepositoryVersion, Publication
+from pulpcore.app.models import Content, ContentArtifact, RepositoryVersion, Publication
 from pulpcore.app.viewsets import NamedModelViewSet
+from pulpcore.app.util import get_prn, get_domain_pk, extract_pk, raise_for_unknown_content_units
+
+
+# Lookup conversion table from old resource hrefs to new PDRN resource names
+OLD_RESOURCE_HREFS = {
+    "/api/v3/orphans/cleanup/": "orphans",
+    "/api/v3/repair/": "repair",
+    "/api/v3/distributions/": "distributions",
+    "/api/v3/repositories/reclaim_space/": "reclaim_space",
+    "/api/v3/servers/": "servers",
+}
 
 
 class ReservedResourcesFilter(Filter):
@@ -37,7 +48,7 @@ class ReservedResourcesFilter(Filter):
 
         Args:
             qs (django.db.models.query.QuerySet): The Queryset to filter
-            value (string|List[str]): href to a reference to a reserved resource or a list thereof
+            value (string|List[str]): href/prn to a reserved resource or a list thereof
 
         Returns:
             django.db.models.query.QuerySet: Queryset filtered by the reserved resource
@@ -46,6 +57,17 @@ class ReservedResourcesFilter(Filter):
         if value is not None:
             if isinstance(value, str):
                 value = [value]
+            # Ensure passing hrefs still works as valid filterable
+            for i, item in enumerate(value):
+                if item.startswith(settings.API_ROOT):
+                    try:
+                        prn = get_prn(uri=item)
+                    except DRFValidationError:
+                        pass
+                    else:
+                        value[i] = prn
+                elif item in OLD_RESOURCE_HREFS:
+                    value[i] = f"pdrn:{get_domain_pk()}:{OLD_RESOURCE_HREFS[item]}"
             if self.exclusive:
                 if self.shared:
                     for item in value:
@@ -64,36 +86,6 @@ class ReservedResourcesInFilter(BaseInFilter, ReservedResourcesFilter):
     """
     Enables a user to filter tasks by a list of reserved resource hrefs.
     """
-
-
-class ReservedResourcesRecordFilter(Filter):
-    """
-    Enables a user to filter tasks by a reserved resource href.
-
-    Warning: This filter is badly documented and not fully functional, but we need to keep it for
-    compatibility reasons. Use ``ReservedResourcesFilter`` instead.
-    """
-
-    def filter(self, qs, value):
-        """
-        Args:
-            qs (django.db.models.query.QuerySet): The Queryset to filter
-            value (string): href containing a reference to a reserved resource
-
-        Returns:
-            django.db.models.query.QuerySet: Queryset filtered by the reserved resource
-        """
-
-        if value is None:
-            # a value was not supplied by a user
-            return qs
-
-        try:
-            resolve(urlparse(value).path)
-        except Resolver404:
-            raise serializers.ValidationError(detail=_("URI not valid: {u}").format(u=value))
-
-        return qs.filter(reserved_resources_record__contains=[value])
 
 
 class CreatedResourcesFilter(Filter):
@@ -117,28 +109,27 @@ class CreatedResourcesFilter(Filter):
         if value is None:
             return qs
 
-        match = resolve(value)
-        resource = NamedModelViewSet.get_resource(value, match.func.cls.queryset.model)
+        resource = NamedModelViewSet.get_resource(value)
 
         return qs.filter(created_resources__object_id=resource.pk)
 
 
-class RepoVersionHrefFilter(Filter):
+class RepoVersionHrefPrnFilter(Filter):
     """
     Filter Content by a Repository Version.
     """
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("help_text", _("Repository Version referenced by HREF"))
+        kwargs.setdefault("help_text", _("Repository Version referenced by HREF/PRN"))
         super().__init__(*args, **kwargs)
 
     @staticmethod
     def get_repository_version(value):
         """
-        Get the repository version from the HREF value provided by the user.
+        Get the repository version from the HREF/PRN value provided by the user.
 
         Args:
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
         """
         if not value:
             raise serializers.ValidationError(
@@ -151,21 +142,21 @@ class RepoVersionHrefFilter(Filter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Content Queryset
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
         """
         raise NotImplementedError()
 
 
-class RepositoryVersionFilter(RepoVersionHrefFilter):
+class RepositoryVersionFilter(RepoVersionHrefPrnFilter):
     """
-    Filter by RepositoryVersion href.
+    Filter by RepositoryVersion href/prn.
     """
 
     def filter(self, qs, value):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Queryset to filter
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
 
         Returns:
             Queryset filtered by given repository version on field_name
@@ -179,7 +170,7 @@ class RepositoryVersionFilter(RepoVersionHrefFilter):
         return qs.filter(**{key: repo_version.pk})
 
 
-class ArtifactRepositoryVersionFilter(RepoVersionHrefFilter):
+class ArtifactRepositoryVersionFilter(RepoVersionHrefPrnFilter):
     """
     Filter used to get the artifacts in a repository version.
     """
@@ -188,7 +179,7 @@ class ArtifactRepositoryVersionFilter(RepoVersionHrefFilter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Artifact Queryset
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
 
         Returns:
             Queryset of the artifacts contained within the specified repository version
@@ -203,7 +194,7 @@ class ArtifactRepositoryVersionFilter(RepoVersionHrefFilter):
         return qs.filter(pk__in=artifact_pks)
 
 
-class ContentRepositoryVersionFilter(RepoVersionHrefFilter):
+class ContentRepositoryVersionFilter(RepoVersionHrefPrnFilter):
     """
     Filter used to get the content of this type found in a repository version.
     """
@@ -212,7 +203,7 @@ class ContentRepositoryVersionFilter(RepoVersionHrefFilter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Content Queryset
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
 
         Returns:
             Queryset of the content contained within the specified repository version
@@ -225,7 +216,7 @@ class ContentRepositoryVersionFilter(RepoVersionHrefFilter):
         return qs.filter(pk__in=repo_version.content)
 
 
-class ContentAddedRepositoryVersionFilter(RepoVersionHrefFilter):
+class ContentAddedRepositoryVersionFilter(RepoVersionHrefPrnFilter):
     """
     Filter used to get the content of this type found in a repository version.
     """
@@ -234,7 +225,7 @@ class ContentAddedRepositoryVersionFilter(RepoVersionHrefFilter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Content Queryset
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
 
         Returns:
             Queryset of the content added by the specified repository version
@@ -247,7 +238,7 @@ class ContentAddedRepositoryVersionFilter(RepoVersionHrefFilter):
         return qs.filter(pk__in=repo_version.added())
 
 
-class ContentRemovedRepositoryVersionFilter(RepoVersionHrefFilter):
+class ContentRemovedRepositoryVersionFilter(RepoVersionHrefPrnFilter):
     """
     Filter used to get the content of this type found in a repository version.
     """
@@ -256,7 +247,7 @@ class ContentRemovedRepositoryVersionFilter(RepoVersionHrefFilter):
         """
         Args:
             qs (django.db.models.query.QuerySet): The Content Queryset
-            value (string): The RepositoryVersion href to filter by
+            value (string): The RepositoryVersion href/prn to filter by
 
         Returns:
             Queryset of the content removed by the specified repository version
@@ -332,6 +323,47 @@ class LabelFilter(Filter):
         return qs
 
 
+class WithContentFilter(Filter):
+    """Filter class for filtering by content in Publications and RepositoryVersions."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("help_text", _("Content Unit referenced by HREF/PRN"))
+        super().__init__(*args, **kwargs)
+
+    def filter(self, qs, value):
+        """
+        Args:
+            qs (django.db.models.query.QuerySet): The Publication/RepositoryVersion Queryset
+            value (string or list[string]): of content href/prn(s) to filter
+
+        Returns:
+            Queryset of the Publication/RepositoryVersion containing the specified content
+        """
+        if value is None:
+            # user didn't supply a value
+            return qs
+
+        if not value:
+            raise serializers.ValidationError(detail=_("No value supplied for content filter"))
+
+        if isinstance(value, str):
+            value = [value]
+
+        content_units = {}
+        for url in value:
+            content_units[extract_pk(url)] = url
+
+        content_units_pks = set(content_units.keys())
+        existing_content_units = Content.objects.filter(pk__in=content_units_pks)
+        raise_for_unknown_content_units(existing_content_units, content_units)
+
+        return qs.with_content(content_units_pks)
+
+
+class WithContentInFilter(BaseInFilter, WithContentFilter):
+    """The multi-content variant of WithContentFilter."""
+
+
 class DistributionWithContentFilter(Filter):
     """A Filter class enabling filtering by content units served by distributions."""
 
@@ -355,12 +387,12 @@ class DistributionWithContentFilter(Filter):
         for dist in qs.exclude(publication=None).values("publication__repository_version", "pk"):
             versions_distributions[dist["publication__repository_version"]].append(dist["pk"])
 
-        for dist in qs.exclude(repository_version=None).values("repository_version", "pk"):
-            if not dist.cast().SERVE_FROM_PUBLICATION:
+        for dist in qs.exclude(repository_version=None).values("repository_version", "pulp_type"):
+            if not dist.detail_model.SERVE_FROM_PUBLICATION:
                 versions_distributions[dist["repository_version"]].append(dist["pk"])
 
         for dist in qs.exclude(repository=None).prefetch_related("repository__versions"):
-            if dist.cast().SERVE_FROM_PUBLICATION:
+            if dist.detail_model.SERVE_FROM_PUBLICATION:
                 versions = dist.repository.versions.values_list("pk", flat=True)
                 publications = Publication.objects.filter(
                     repository_version__in=versions, complete=True

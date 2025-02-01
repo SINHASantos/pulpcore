@@ -1,7 +1,5 @@
 from gettext import gettext as _
 
-from django.conf import settings
-from django.urls import reverse
 from rest_framework import serializers
 
 from pulpcore.app import models
@@ -13,12 +11,13 @@ from pulpcore.app.serializers import (
     RelatedField,
     RelatedResourceField,
     TaskGroupStatusCountField,
+    fields,
 )
 from pulpcore.constants import TASK_STATES
-from pulpcore.app.util import get_domain
+from pulpcore.app.util import reverse
 
 
-class CreatedResourceSerializer(RelatedResourceField):
+class CreatedResourceField(RelatedResourceField):
     class Meta:
         model = models.CreatedResource
         fields = []
@@ -38,14 +37,16 @@ class TaskSerializer(ModelSerializer):
         help_text=_("The logging correlation id associated with this task")
     )
     created_by = serializers.SerializerMethodField(help_text=_("User who dispatched this task."))
+    unblocked_at = serializers.DateTimeField(
+        help_text=_("Timestamp of when this task was identified ready for pickup."), read_only=True
+    )
     started_at = serializers.DateTimeField(
-        help_text=_("Timestamp of the when this task started execution."), read_only=True
+        help_text=_("Timestamp of when this task started execution."), read_only=True
     )
     finished_at = serializers.DateTimeField(
-        help_text=_("Timestamp of the when this task stopped execution."), read_only=True
+        help_text=_("Timestamp of when this task stopped execution."), read_only=True
     )
-    error = serializers.DictField(
-        child=serializers.JSONField(),
+    error = fields.JSONDictField(
         help_text=_(
             "A JSON Object of a fatal error encountered during the execution of this task."
         ),
@@ -76,7 +77,7 @@ class TaskSerializer(ModelSerializer):
         view_name="task-groups-detail",
     )
     progress_reports = ProgressReportSerializer(many=True, read_only=True)
-    created_resources = CreatedResourceSerializer(
+    created_resources = CreatedResourceField(
         help_text=_("Resources created by this task."),
         many=True,
         read_only=True,
@@ -92,9 +93,8 @@ class TaskSerializer(ModelSerializer):
         if task_user_map := self.context.get("task_user_mapping"):
             if user_id := task_user_map.get(str(obj.pk)):
                 kwargs = {"pk": user_id}
-                if settings.DOMAIN_ENABLED:
-                    kwargs["pulp_domain"] = get_domain().name
-                return reverse("users-detail", kwargs=kwargs)
+                request = self.context.get("request")
+                return reverse("users-detail", kwargs=kwargs, request=request)
         return None
 
     class Meta:
@@ -104,6 +104,7 @@ class TaskSerializer(ModelSerializer):
             "name",
             "logging_cid",
             "created_by",
+            "unblocked_at",
             "started_at",
             "finished_at",
             "error",
@@ -123,6 +124,7 @@ class MinimalTaskSerializer(TaskSerializer):
         fields = ModelSerializer.Meta.fields + (
             "name",
             "state",
+            "unblocked_at",
             "started_at",
             "finished_at",
             "worker",
@@ -164,6 +166,7 @@ class TaskGroupSerializer(ModelSerializer):
         model = models.TaskGroup
         fields = (
             "pulp_href",
+            "prn",
             "description",
             "all_tasks_dispatched",
             "waiting",
@@ -178,14 +181,35 @@ class TaskGroupSerializer(ModelSerializer):
         )
 
 
-class TaskCancelSerializer(ModelSerializer):
+class TaskCancelSerializer(serializers.Serializer):
     state = serializers.CharField(
         help_text=_("The desired state of the task. Only 'canceled' is accepted."),
+        required=True,
+    )
+
+    def validate_state(self, value):
+        if value != "canceled":
+            raise serializers.ValidationError(
+                _("The only acceptable value for 'state' is 'canceled'.")
+            )
+        return value
+
+    class Meta:
+        fields = ("state",)
+
+
+class ApiAppStatusSerializer(ModelSerializer):
+    name = serializers.CharField(help_text=_("The name of the worker."), read_only=True)
+    last_heartbeat = serializers.DateTimeField(
+        help_text=_("Timestamp of the last time the worker talked to the service."), read_only=True
+    )
+    versions = serializers.HStoreField(
+        help_text=_("Versions of the components installed."), read_only=True
     )
 
     class Meta:
-        model = models.Task
-        fields = ("state",)
+        model = models.ApiAppStatus
+        fields = ("name", "last_heartbeat", "versions")
 
 
 class ContentAppStatusSerializer(ModelSerializer):
@@ -193,10 +217,13 @@ class ContentAppStatusSerializer(ModelSerializer):
     last_heartbeat = serializers.DateTimeField(
         help_text=_("Timestamp of the last time the worker talked to the service."), read_only=True
     )
+    versions = serializers.HStoreField(
+        help_text=_("Versions of the components installed."), read_only=True
+    )
 
     class Meta:
         model = models.ContentAppStatus
-        fields = ("name", "last_heartbeat")
+        fields = ("name", "last_heartbeat", "versions")
 
 
 class WorkerSerializer(ModelSerializer):
@@ -205,6 +232,9 @@ class WorkerSerializer(ModelSerializer):
     name = serializers.CharField(help_text=_("The name of the worker."), read_only=True)
     last_heartbeat = serializers.DateTimeField(
         help_text=_("Timestamp of the last time the worker talked to the service."), read_only=True
+    )
+    versions = serializers.HStoreField(
+        help_text=_("Versions of the components installed."), read_only=True
     )
     current_task = RelatedField(
         help_text=_(
@@ -217,16 +247,25 @@ class WorkerSerializer(ModelSerializer):
 
     class Meta:
         model = models.Worker
-        fields = ModelSerializer.Meta.fields + ("name", "last_heartbeat", "current_task")
+        fields = ModelSerializer.Meta.fields + (
+            "name",
+            "last_heartbeat",
+            "versions",
+            "current_task",
+        )
 
 
 class TaskScheduleSerializer(ModelSerializer):
     pulp_href = IdentityField(view_name="task-schedules-detail")
     name = serializers.CharField(help_text=_("The name of the task schedule."), allow_blank=False)
     task_name = serializers.CharField(help_text=_("The name of the task to be scheduled."))
-    dispatch_interval = serializers.DurationField(help_text=_("Periodicity of the schedule."))
+    dispatch_interval = serializers.DurationField(
+        help_text=_("Periodicity of the schedule."), allow_null=True
+    )
     next_dispatch = serializers.DateTimeField(
-        help_text=_("Timestamp of the next time the task will be dispatched."), read_only=True
+        help_text=_("Timestamp of the next time the task will be dispatched."),
+        read_only=True,
+        allow_null=True,
     )
     last_task = RelatedField(
         help_text=_("The last task dispatched by this schedule."),
@@ -242,4 +281,23 @@ class TaskScheduleSerializer(ModelSerializer):
             "dispatch_interval",
             "next_dispatch",
             "last_task",
+        )
+
+
+class TaskStatusMessageSerializer(TaskSerializer):
+    """
+    Serializer for Task status messages.
+
+    Independent of other serializers in order to decouple the task message schema from other
+    interfaces.
+    """
+
+    class Meta:
+        model = models.Task
+        fields = ModelSerializer.Meta.fields + (
+            "name",
+            "state",
+            "unblocked_at",
+            "started_at",
+            "finished_at",
         )

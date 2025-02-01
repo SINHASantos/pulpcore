@@ -1,10 +1,14 @@
-from django.core.files.storage import get_storage_class, default_storage
+from django.core.files.storage import default_storage
 from django.db import models
 from django_lifecycle import hook, BEFORE_DELETE, BEFORE_UPDATE
 
 from pulpcore.app.models import BaseModel, AutoAddObjPermsMixin
+from pulpcore.exceptions import DomainProtectedError
 
 from .fields import EncryptedJSONField
+
+# Global used to store instantiated storage classes to speed up lookups across domains
+storages = {}
 
 
 class Domain(BaseModel, AutoAddObjPermsMixin):
@@ -41,8 +45,17 @@ class Domain(BaseModel, AutoAddObjPermsMixin):
         """Returns this domain's instantiated storage class."""
         if self.name == "default":
             return default_storage
-        storage_class = get_storage_class(self.storage_class)
-        return storage_class(**self.storage_settings)
+
+        if date_storage_tuple := storages.get(self.pulp_id):
+            last_updated, storage = date_storage_tuple
+            if self.pulp_last_updated == last_updated:
+                return storage
+
+        from pulpcore.app.serializers import DomainSerializer
+
+        storage = DomainSerializer(instance=self).create_storage()
+        storages[self.pulp_id] = (self.pulp_last_updated, storage)
+        return storage
 
     @hook(BEFORE_DELETE, when="name", is_now="default")
     @hook(BEFORE_UPDATE, when="name", was="default")
@@ -51,8 +64,9 @@ class Domain(BaseModel, AutoAddObjPermsMixin):
 
     @hook(BEFORE_DELETE, when="name", is_not="default")
     def _cleanup_orphans_pre_delete(self):
-        if self.content_set.exclude(version_memberships__isnull=True).exists():
-            raise models.ProtectedError("There is active content in the domain.")
+        protected_content_set = self.content_set.exclude(version_memberships__isnull=True)
+        if protected_content_set.exists():
+            raise DomainProtectedError()
         self.content_set.filter(version_memberships__isnull=True).delete()
         for artifact in self.artifact_set.all().iterator():
             # Delete on by one to properly cleanup the storage.

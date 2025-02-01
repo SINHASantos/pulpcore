@@ -1,5 +1,6 @@
 import enum
 import json
+import time
 
 from functools import wraps
 
@@ -19,6 +20,8 @@ from pulpcore.app.redis_connection import (
     get_async_redis_connection,
 )
 from pulpcore.responses import ArtifactResponse
+
+from pulpcore.metrics import artifacts_size_counter
 
 DEFAULT_EXPIRES_TTL = settings.CACHE_SETTINGS["EXPIRES_TTL"]
 
@@ -185,7 +188,11 @@ class SyncContentCache(Cache):
             return None
         entry = json.loads(entry)
         response_type = entry.pop("type", None)
-        if not response_type or response_type not in self.RESPONSE_TYPES:
+        # None means "doesn't expire", unset means "already expired".
+        expires = entry.pop("expires", -1)
+        if (not response_type or response_type not in self.RESPONSE_TYPES) or (
+            expires and expires < time.time()
+        ):
             # Bad entry, delete from cache
             self.delete(key, base_key)
             return None
@@ -198,6 +205,12 @@ class SyncContentCache(Cache):
         """Gets the response for the request and try to turn it into a cacheable entry"""
         response = handler(*args, **kwargs)
         entry = {"headers": dict(response.headers), "status": response.status_code}
+        if expires is not None:
+            # Redis TTL is not sufficient: https://github.com/pulp/pulpcore/issues/4845
+            entry["expires"] = expires + time.time()
+        else:
+            # Settings allow you to set None to mean "does not expire". Persist.
+            entry["expires"] = None
         response.headers["X-PULP-CACHE"] = "MISS"
         if isinstance(response, HttpResponseRedirect):
             entry["redirect_to"] = str(response.headers["Location"])
@@ -297,6 +310,8 @@ class AsyncContentCache(AsyncCache):
         "Redirect": HTTPFound,
     }
 
+    ADD_TRAILING_SLASH = True
+
     def __init__(self, base_key=None, expires_ttl=None, keys=None, auth=None):
         """
         Initiates a cache instance to be used for dealing with an aiohttp server
@@ -339,6 +354,9 @@ class AsyncContentCache(AsyncCache):
                 response = await self.make_entry(
                     key, bk, func, args, kwargs, self.default_expires_ttl
                 )
+            elif size := response.headers.get("X-PULP-ARTIFACT-SIZE"):
+                artifacts_size_counter.add(size)
+
             return response
 
         return cached_function
@@ -364,9 +382,13 @@ class AsyncContentCache(AsyncCache):
             entry["body"] = bytes.fromhex(binary)
 
         response_type = entry.pop("type", None)
-        if not response_type or response_type not in self.RESPONSE_TYPES:
+        # None means "doesn't expire", unset means "already expired".
+        expires = entry.pop("expires", -1)
+        if (not response_type or response_type not in self.RESPONSE_TYPES) or (
+            expires and expires < time.time()
+        ):
             # Bad entry, delete from cache
-            self.delete(key, base_key)
+            await self.delete(key, base_key)
             return None
         response = self.RESPONSE_TYPES[response_type](**entry)
         response.headers.update({"X-PULP-CACHE": "HIT"})
@@ -380,6 +402,12 @@ class AsyncContentCache(AsyncCache):
             response = e
 
         entry = {"headers": dict(response.headers), "status": response.status}
+        if expires is not None:
+            # Redis TTL is not sufficient: https://github.com/pulp/pulpcore/issues/4845
+            entry["expires"] = expires + time.time()
+        else:
+            # Settings allow you to set None to mean "does not expire". Persist.
+            entry["expires"] = None
         response.headers.update({"X-PULP-CACHE": "MISS"})
         if isinstance(response, FileResponse):
             entry["path"] = str(response._path)

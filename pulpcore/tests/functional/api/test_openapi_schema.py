@@ -1,14 +1,18 @@
 """Test related to the openapi schema Pulp generates."""
-import asyncio
+
 import copy
 import json
+import os
 
-import aiohttp
 import pytest
 import jsonschema
 
-from drf_spectacular.validation import JSON_SCHEMA_SPEC_PATH
-from jsonschema import ValidationError
+from drf_spectacular import validation
+from collections import defaultdict
+
+JSON_SCHEMA_SPEC_PATH = os.path.join(
+    os.path.dirname(validation.__file__), "openapi_3_0_schema.json"
+)
 
 
 @pytest.fixture(scope="session")
@@ -30,28 +34,6 @@ def openapi3_schema_with_modified_safe_chars(openapi3_schema_spec):
     return openapi3_schema_spec_copy
 
 
-@pytest.fixture(scope="session")
-def pulp_openapi_schema_url(pulp_api_v3_url):
-    return f"{pulp_api_v3_url}docs/api.json"
-
-
-@pytest.fixture(scope="session")
-def pulp_openapi_schema(pulp_openapi_schema_url):
-    return asyncio.run(_download_schema(pulp_openapi_schema_url))
-
-
-@pytest.fixture(scope="session")
-def pulp_openapi_schema_pk_path_set(pulp_openapi_schema_url):
-    url = f"{pulp_openapi_schema_url}?pk_path=1"
-    return asyncio.run(_download_schema(url))
-
-
-async def _download_schema(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            return await response.json()
-
-
 @pytest.mark.parallel
 @pytest.mark.from_pulpcore_for_all_plugins
 def test_valid_with_pk_path_set(pulp_openapi_schema_pk_path_set, openapi3_schema_spec):
@@ -61,7 +43,7 @@ def test_valid_with_pk_path_set(pulp_openapi_schema_pk_path_set, openapi3_schema
 @pytest.mark.parallel
 @pytest.mark.from_pulpcore_for_all_plugins
 def test_invalid_default_schema(pulp_openapi_schema, openapi3_schema_spec):
-    with pytest.raises(ValidationError):
+    with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=pulp_openapi_schema, schema=openapi3_schema_spec)
 
 
@@ -71,3 +53,52 @@ def test_valid_with_safe_chars(pulp_openapi_schema, openapi3_schema_with_modifie
     jsonschema.validate(
         instance=pulp_openapi_schema, schema=openapi3_schema_with_modified_safe_chars
     )
+
+
+@pytest.mark.parallel
+@pytest.mark.from_pulpcore_for_all_plugins
+def test_no_dup_operation_ids(pulp_openapi_schema):
+    paths = pulp_openapi_schema["paths"]
+    operation_ids = defaultdict(int)
+    for p in paths.values():
+        for operation in p.values():
+            operation_ids[operation["operationId"]] += 1
+
+    dup_ids = [id for id, cnt in operation_ids.items() if cnt > 1]
+    assert len(dup_ids) == 0, f"Duplicate operationIds found: {dup_ids}"
+
+
+@pytest.mark.parallel
+def test_external_auth_on_security_scheme(pulp_settings, pulp_openapi_schema):
+    if (
+        "django.contrib.auth.backends.RemoteUserBackend"
+        not in pulp_settings.AUTHENTICATION_BACKENDS
+        or "pulpcore.app.authentication.JSONHeaderRemoteAuthentication"
+        not in pulp_settings.REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"]
+    ):
+        pytest.skip(
+            "Test can't run unless RemoteUserBackend and JSONHeaderRemoteAuthentication are enabled"
+        )
+
+    security_schemes = pulp_openapi_schema["components"]["securitySchemes"]
+    assert "json_header_remote_authentication" in security_schemes
+
+    security_scheme = security_schemes["json_header_remote_authentication"]
+    assert pulp_settings.AUTHENTICATION_JSON_HEADER_OPENAPI_SECURITY_SCHEME == security_scheme
+
+
+@pytest.mark.parallel
+def test_content_in_filter_is_array(pulp_openapi_schema):
+    tested = []
+    for name, path in pulp_openapi_schema["paths"].items():
+        if name.endswith("repository_versions/") or name.endswith("publications/"):
+            tested.append(name)
+            for parameter in path["get"]["parameters"]:
+                if parameter["name"] == "content__in":
+                    schema = parameter["schema"]
+                    assert schema["type"] == "array"
+                    assert schema["items"]["type"] == "string"
+                    break
+            else:
+                assert False, "Couldn't find the content__in filter!"
+    assert len(tested) == 2, "Couldn't test both the Publication and RepositoryVersion endpoints"

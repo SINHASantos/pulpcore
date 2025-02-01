@@ -1,15 +1,18 @@
 from gettext import gettext as _
 
+from django.db import transaction
 from django.db.models import Prefetch
 from django_filters.rest_framework import filters
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, inline_serializer
 from rest_framework import mixins, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
-from rest_framework.serializers import ValidationError
+from rest_framework.serializers import DictField, URLField, ValidationError
 
 from pulpcore.filters import BaseFilterSet
 from pulpcore.app.models import (
+    ProfileArtifact,
     Task,
     TaskGroup,
     TaskSchedule,
@@ -30,24 +33,20 @@ from pulpcore.app.serializers import (
     WorkerSerializer,
 )
 from pulpcore.app.tasks import purge
-from pulpcore.app.util import get_domain
+from pulpcore.app.util import get_domain, get_artifact_url
 from pulpcore.app.viewsets import NamedModelViewSet, RolesMixin
 from pulpcore.app.viewsets.base import DATETIME_FILTER_OPTIONS, NAME_FILTER_OPTIONS
 from pulpcore.app.viewsets.custom_filters import (
     ReservedResourcesFilter,
     ReservedResourcesInFilter,
-    ReservedResourcesRecordFilter,
     CreatedResourcesFilter,
 )
 from pulpcore.constants import TASK_INCOMPLETE_STATES, TASK_STATES
-from pulpcore.tasking.tasks import dispatch
-from pulpcore.tasking.util import cancel_task
+from pulpcore.tasking.tasks import dispatch, cancel_task, cancel_task_group
+from pulpcore.app.role_util import get_objects_for_user
 
 
 class TaskFilter(BaseFilterSet):
-    # This filter is deprecated and badly documented, but we need to keep it for compatibility
-    # reasons
-    reserved_resources_record = ReservedResourcesRecordFilter()
     created_resources = CreatedResourcesFilter()
     # Non model field filters
     reserved_resources = ReservedResourcesFilter(exclusive=True, shared=True)
@@ -60,16 +59,16 @@ class TaskFilter(BaseFilterSet):
     class Meta:
         model = Task
         fields = {
-            "state": ["exact", "in"],
-            "worker": ["exact", "in"],
-            "name": ["exact", "contains", "in"],
+            "state": ["exact", "in", "ne"],
+            "worker": ["exact", "in", "isnull"],
+            "name": ["exact", "contains", "in", "ne"],
             "logging_cid": ["exact", "contains"],
             "started_at": DATETIME_FILTER_OPTIONS,
             "finished_at": DATETIME_FILTER_OPTIONS,
+            "unblocked_at": DATETIME_FILTER_OPTIONS,
             "parent_task": ["exact"],
             "child_tasks": ["exact"],
             "task_group": ["exact"],
-            "reserved_resources_record": ["exact"],
             "created_resources": ["exact"],
         }
 
@@ -97,6 +96,12 @@ class TaskViewSet(
                 "principal": "authenticated",
                 "effect": "allow",
                 "condition": "has_model_or_domain_or_obj_perms:core.view_task",
+            },
+            {
+                "action": ["profile_artifacts"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_domain_or_obj_perms:core.view_task_profile_artifacts",
             },
             {
                 "action": ["destroy"],
@@ -137,12 +142,17 @@ class TaskViewSet(
             "description": "Allow all actions on a task.",
             "permissions": [
                 "core.view_task",
+                "core.view_task_profile_artifacts",
                 "core.change_task",
                 "core.delete_task",
                 "core.manage_roles_task",
             ],
         },
         "core.task_viewer": ["core.view_task"],
+        # This is a special role to designate the user who dispatched the task, it is assigned to
+        # the user on the object-level at task creation. It is not meant to be edited or manually
+        # added/removed from users.
+        "core.task_user_dispatcher": ["core.add_task"],
     }
 
     def get_serializer(self, *args, **kwargs):
@@ -191,6 +201,11 @@ class TaskViewSet(
                 ),
                 Prefetch("child_tasks", queryset=Task.objects.only("pk")),
             )
+        if self.action in ("add_role", "remove_role"):
+            if "core.task_user_dispatcher" == self.request.data.get("role"):
+                raise ValidationError(
+                    _("core.task_user_dispatcher can not be added/removed from a task.")
+                )
         return qs
 
     @extend_schema(
@@ -200,11 +215,10 @@ class TaskViewSet(
         responses={200: TaskSerializer, 409: TaskSerializer},
     )
     def partial_update(self, request, pk=None, partial=True):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
         task = self.get_object()
-        if "state" not in request.data:
-            raise ValidationError(_("'state' must be provided with the request."))
-        if request.data["state"] != "canceled":
-            raise ValidationError(_("The only acceptable value for 'state' is 'canceled'."))
         task = cancel_task(task.pk)
         # Check whether task is actually canceled
         http_status = (
@@ -248,12 +262,87 @@ class TaskViewSet(
         )
         return OperationPostponedResponse(task, request)
 
+    @extend_schema(
+        summary=_("Fetch downloadable links for profile artifacts"),
+        responses=inline_serializer(
+            "ProfileArtifactResponse",
+            fields={"urls": DictField(child=URLField())},
+        ),
+    )
+    @action(detail=True)
+    def profile_artifacts(self, request, pk):
+        """
+        Return pre-signed URLs used for downloading raw profile artifacts.
+        """
+        task = self.get_object()
+        data = {}
 
-class TaskGroupViewSet(NamedModelViewSet, mixins.RetrieveModelMixin, mixins.ListModelMixin):
+        for pa in ProfileArtifact.objects.select_related("artifact").filter(task=task):
+            data[pa.name] = get_artifact_url(pa.artifact)
+
+        return Response({"urls": data})
+
+
+class TaskGroupViewSet(mixins.RetrieveModelMixin, mixins.ListModelMixin, NamedModelViewSet):
     queryset = TaskGroup.objects.all()
     endpoint_name = "task-groups"
     serializer_class = TaskGroupSerializer
     ordering = "-pulp_created"
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list", "retrieve", "partial_update"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+        ],
+        "queryset_scoping": {"function": "scope_queryset"},
+    }
+
+    def scope_queryset(self, qs):
+        """Filter based on having view permission on the parent task of the group."""
+        if not self.request.user.is_superuser:
+            task_viewset = TaskViewSet()
+            setattr(task_viewset, "request", self.request)
+            setattr(task_viewset, "action", "group")  # Set this to avoid extra prefetch queries
+            tasks = (
+                task_viewset.get_queryset()
+                .filter(parent_task__isnull=True, task_group__isnull=False)
+                .values_list("pk", flat=True)
+            )
+            qs = qs.filter(tasks__in=tasks)
+        return qs
+
+    @extend_schema(
+        description="This operation cancels a task group.",
+        summary="Cancel a task group",
+        operation_id="task_groups_cancel",
+        request=TaskCancelSerializer,
+        responses={200: TaskGroupSerializer, 409: TaskGroupSerializer},
+    )
+    def partial_update(self, request, pk=None, partial=True):
+        TaskCancelSerializer(data=request.data, context={"request": request}).is_valid(
+            raise_exception=True
+        )
+
+        task_group = self.get_object()
+        with transaction.atomic():
+            if (
+                task_group.tasks.count()
+                != get_objects_for_user(
+                    request.user, "core.change_task", task_group.tasks.all()
+                ).count()
+            ):
+                raise PermissionDenied()
+        task_group = cancel_task_group(task_group.pk)
+        # Check whether task group is actually canceled
+        serializer = TaskGroupSerializer(task_group, context={"request": request})
+        task_statuses = (
+            task["state"] in (TASK_STATES.RUNNING, TASK_STATES.WAITING)
+            for task in serializer.data["tasks"]
+        )
+        return Response(serializer.data, status=409 if any(task_statuses) else 200)
 
 
 class WorkerFilter(BaseFilterSet):
@@ -268,7 +357,7 @@ class WorkerFilter(BaseFilterSet):
         }
 
     def filter_online(self, queryset, name, value):
-        online_workers = Worker.objects.online_workers()
+        online_workers = Worker.objects.online()
 
         if value:
             return queryset.filter(pk__in=online_workers)
@@ -276,7 +365,7 @@ class WorkerFilter(BaseFilterSet):
             return queryset.exclude(pk__in=online_workers)
 
     def filter_missing(self, queryset, name, value):
-        missing_workers = Worker.objects.missing_workers()
+        missing_workers = Worker.objects.missing()
 
         if value:
             return queryset.filter(pk__in=missing_workers)

@@ -1,14 +1,29 @@
 from pathlib import Path
 
 from django.conf import settings
-from django.core.checks import Warning as CheckWarning, register
+from django.core.checks import Error as CheckError, Warning as CheckWarning, register
+
+
+@register(deploy=True)
+def secret_key_check(app_configs, **kwargs):
+    messages = []
+    if getattr(settings, "SECRET_KEY", "SECRET") == "SECRET":
+        messages.append(
+            CheckError(
+                "SECRET_KEY is a required setting but it was not configured. It does not "
+                "come pre-configured by the installation and it should be set to a unique, "
+                "unpredictable value.",
+                id="pulpcore.E001",
+            )
+        )
+    return messages
 
 
 @register(deploy=True)
 def storage_paths(app_configs, **kwargs):
     warnings = []
 
-    if settings.DEFAULT_FILE_STORAGE == "pulpcore.app.models.storage.FileSystem":
+    if settings.STORAGES["default"]["BACKEND"] == "pulpcore.app.models.storage.FileSystem":
         try:
             media_root_dev = Path(settings.MEDIA_ROOT).stat().st_dev
         except OSError:

@@ -1,6 +1,7 @@
 """
 Django models related to the Tasking system
 """
+
 import logging
 import traceback
 from contextlib import suppress
@@ -12,12 +13,15 @@ from django.contrib.postgres.fields import ArrayField, HStoreField
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, models
 from django.utils import timezone
+from django_lifecycle import hook, AFTER_CREATE
 
 from pulpcore.app.models import (
     AutoAddObjPermsMixin,
     BaseModel,
     GenericRelationModel,
 )
+from pulpcore.app.models.status import BaseAppStatus
+from pulpcore.app.models.fields import EncryptedJSONField
 from pulpcore.constants import TASK_CHOICES, TASK_INCOMPLETE_STATES, TASK_STATES
 from pulpcore.exceptions import AdvisoryLockError, exception_to_dict
 from pulpcore.app.util import get_domain_pk, current_task
@@ -25,58 +29,12 @@ from pulpcore.app.util import get_domain_pk, current_task
 _logger = logging.getLogger(__name__)
 
 
-class WorkerManager(models.Manager):
-    def online_workers(self):
-        """
-        Returns a queryset of workers meeting the criteria to be considered 'online'
-
-        To be considered 'online', a worker must have a recent heartbeat timestamp. "Recent" is
-        defined here as "within the pulp process timeout interval".
-
-        Returns:
-            :class:`django.db.models.query.QuerySet`:  A query set of the Worker objects which
-                are considered by Pulp to be 'online'.
-        """
-        now = timezone.now()
-        age_threshold = now - timedelta(seconds=settings.WORKER_TTL)
-
-        return self.filter(last_heartbeat__gte=age_threshold)
-
-    def missing_workers(self, age=timedelta(seconds=settings.WORKER_TTL)):
-        """
-        Returns a queryset of workers meeting the criteria to be considered 'missing'
-
-        To be considered missing, a worker must have a stale timestamp.  By default, stale is
-        defined here as longer than the ``settings.WORKER_TTL``, or you can specify age as a
-        timedelta.
-
-        Args:
-            age (datetime.timedelta): Workers who have heartbeats older than this time interval are
-                considered missing.
-
-        Returns:
-            :class:`django.db.models.query.QuerySet`:  A query set of the Worker objects which
-                are considered by Pulp to be 'missing'.
-        """
-        age_threshold = timezone.now() - age
-        return self.filter(last_heartbeat__lt=age_threshold)
-
-
-class Worker(BaseModel):
+class Worker(BaseAppStatus):
     """
     Represents a worker
-
-    Fields:
-
-        name (models.TextField): The name of the worker, in the format "worker_type@hostname"
-        last_heartbeat (models.DateTimeField): A timestamp of this worker's last heartbeat
     """
 
-    objects = WorkerManager()
-
-    name = models.TextField(db_index=True, unique=True)
-    last_heartbeat = models.DateTimeField(auto_now=True)
-    versions = HStoreField(default=dict)
+    APP_TTL = timedelta(seconds=settings.WORKER_TTL)
 
     @property
     def current_task(self):
@@ -88,54 +46,30 @@ class Worker(BaseModel):
         """
         return self.tasks.filter(state="running").first()
 
-    @property
-    def online(self):
-        """
-        Whether a worker can be considered 'online'
-
-        To be considered 'online', a worker must have a recent heartbeat timestamp. "Recent" is
-        defined here as "within the pulp process timeout interval".
-
-        Returns:
-            bool: True if the worker is considered online, otherwise False
-        """
-        now = timezone.now()
-        age_threshold = now - timedelta(seconds=settings.WORKER_TTL)
-
-        return self.last_heartbeat >= age_threshold
-
-    @property
-    def missing(self):
-        """
-        Whether a worker can be considered 'missing'
-
-        To be considered 'missing', a worker must have a stale timestamp meaning that it was not
-        shutdown 'cleanly' and may have died.  Stale is defined here as "beyond the pulp process
-        timeout interval".
-
-        Returns:
-            bool: True if the worker is considered missing, otherwise False
-        """
-        now = timezone.now()
-        age_threshold = now - timedelta(seconds=settings.WORKER_TTL)
-
-        return self.last_heartbeat < age_threshold
-
-    def save_heartbeat(self):
-        """
-        Update the last_heartbeat field to now and save it.
-
-        Only the last_heartbeat field will be saved. No other changes will be saved.
-
-        Raises:
-            ValueError: When the model instance has never been saved before. This method can
-                only update an existing database record.
-        """
-        self.save(update_fields=["last_heartbeat"])
-
 
 def _uuid_to_advisory_lock(value):
     return ((value >> 64) ^ value) & 0x7FFFFFFFFFFFFFFF
+
+
+class ProfileArtifact(BaseModel):
+    """
+    A model encapsulating profiled artifact data
+    """
+
+    artifact = models.ForeignKey("Artifact", on_delete=models.CASCADE)
+    task = models.ForeignKey("Task", on_delete=models.CASCADE)
+    name = models.TextField()
+
+    class Meta:
+        unique_together = ("task", "name")
+
+
+class TaskManager(models.Manager):
+    def get_queryset(self):
+        # Always make encrypted args deferred.
+        # This will prevent a lot of issues when the fernet key is lost.
+        # Only task workers need to be able to read these args anyway.
+        return super().get_queryset().defer("enc_args", "enc_kwargs")
 
 
 class Task(BaseModel, AutoAddObjPermsMixin):
@@ -147,6 +81,9 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         state (models.TextField): The state of the task
         name (models.TextField): The name of the task
         logging_cid (models.TextField): The logging CID associated with the task
+        unblocked_at (models.DateTimeField): The time the task was marked as unblocked.
+            This is supervised/updated by all awake workers and is part of the definition
+            of a ready-to-be-taken task.
         started_at (models.DateTimeField): The time the task started executing
         finished_at (models.DateTimeField): The time the task finished executing
         error (models.JSONField): Fatal errors generated by the task
@@ -155,6 +92,11 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             the task
         reserved_resources_record (django.contrib.postgres.fields.ArrayField): The reserved
             resources required for the task.
+        immediate (models.BooleanField): Whether this is guaranteed to execute fast
+            without blocking. Defaults to `False`.
+        deferred (models.BooleanField): Whether to allow defer running the task to a
+            pulpcore_worker. Both `immediate` and `deferred` cannot both be `False`.
+            Defaults to `True`.
 
     Relations:
 
@@ -163,17 +105,20 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         pulp_domain (models.ForeignKey): The domain the Task is a part of
     """
 
+    objects = TaskManager()
+
     state = models.TextField(choices=TASK_CHOICES)
     name = models.TextField()
     logging_cid = models.TextField(db_index=True)
 
+    unblocked_at = models.DateTimeField(null=True)
     started_at = models.DateTimeField(null=True)
     finished_at = models.DateTimeField(null=True)
 
     error = models.JSONField(null=True)
 
-    args = models.JSONField(null=True, encoder=DjangoJSONEncoder)
-    kwargs = models.JSONField(null=True, encoder=DjangoJSONEncoder)
+    enc_args = EncryptedJSONField(null=True, encoder=DjangoJSONEncoder)
+    enc_kwargs = EncryptedJSONField(null=True, encoder=DjangoJSONEncoder)
 
     worker = models.ForeignKey("Worker", null=True, related_name="tasks", on_delete=models.SET_NULL)
 
@@ -186,6 +131,11 @@ class Task(BaseModel, AutoAddObjPermsMixin):
     reserved_resources_record = ArrayField(models.TextField(), null=True)
     pulp_domain = models.ForeignKey("Domain", default=get_domain_pk, on_delete=models.CASCADE)
     versions = HStoreField(default=dict)
+
+    profile_artifacts = models.ManyToManyField("Artifact", through=ProfileArtifact)
+
+    immediate = models.BooleanField(default=False, null=True)
+    deferred = models.BooleanField(default=True, null=True)
 
     def __str__(self):
         return "Task: {name} [{state}]".format(name=self.name, state=self.state)
@@ -225,6 +175,11 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         """
         return current_task.get()
 
+    @hook(AFTER_CREATE)
+    def add_role_dispatcher(self):
+        """Set the "core.task_user_dispatcher" role for the current user after creation."""
+        self.add_roles_for_object_creator("core.task_user_dispatcher")
+
     def set_running(self):
         """
         Set this Task to the running state, save it, and log output in warning cases.
@@ -234,10 +189,6 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         rows = Task.objects.filter(pk=self.pk, state=TASK_STATES.WAITING).update(
             state=TASK_STATES.RUNNING, started_at=timezone.now()
         )
-        if rows != 1:
-            raise RuntimeError(
-                _("Task set_running() occurred but Task {} is not WAITING").format(self.pk)
-            )
         with suppress(AttributeError):
             del self.state
         with suppress(AttributeError):
@@ -246,6 +197,12 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             del self.finished_at
         with suppress(AttributeError):
             del self.error
+        if rows != 1:
+            raise RuntimeError(
+                _("Attempt to set not waiting task {} to running from '{}'.").format(
+                    self.pk, self.state
+                )
+            )
 
     def set_completed(self):
         """
@@ -258,10 +215,6 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         rows = Task.objects.filter(pk=self.pk, state=TASK_STATES.RUNNING).update(
             state=TASK_STATES.COMPLETED, finished_at=timezone.now()
         )
-        if rows != 1:
-            raise RuntimeError(
-                _("Task set_completed() occurred but Task {} is not RUNNING.").format(self.pk)
-            )
         with suppress(AttributeError):
             del self.state
         with suppress(AttributeError):
@@ -270,6 +223,15 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             del self.finished_at
         with suppress(AttributeError):
             del self.error
+        if rows != 1:
+            # If the user requested to cancel this task while the worker finished it, we leave it
+            # as it is, but accept this is not an error condition.
+            if self.state != TASK_STATES.CANCELING:
+                raise RuntimeError(
+                    _("Attempt to set not running task {} to completed from '{}'.").format(
+                        self.pk, self.state
+                    )
+                )
 
     def set_failed(self, exc, tb):
         """
@@ -288,8 +250,6 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             finished_at=timezone.now(),
             error=exception_to_dict(exc, tb_str),
         )
-        if rows != 1:
-            raise RuntimeError(_("Attempt to set a not running task to failed."))
         with suppress(AttributeError):
             del self.state
         with suppress(AttributeError):
@@ -298,6 +258,12 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             del self.finished_at
         with suppress(AttributeError):
             del self.error
+        if rows != 1:
+            raise RuntimeError(
+                _("Attempt to set not running task {} to failed from '{}'.").format(
+                    self.pk, self.state
+                )
+            )
 
     def set_canceling(self):
         """
@@ -308,8 +274,6 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         rows = Task.objects.filter(pk=self.pk, state__in=TASK_INCOMPLETE_STATES).update(
             state=TASK_STATES.CANCELING,
         )
-        if rows != 1:
-            raise RuntimeError(_("Attempt to cancel a finished task."))
         with suppress(AttributeError):
             del self.state
         with suppress(AttributeError):
@@ -318,6 +282,12 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             del self.finished_at
         with suppress(AttributeError):
             del self.error
+        if rows != 1:
+            raise RuntimeError(
+                _("Attempt to set not incomplete task {} to canceling from '{}'.").format(
+                    self.pk, self.state
+                )
+            )
 
     def set_canceled(self, final_state=TASK_STATES.CANCELED, reason=None):
         """
@@ -333,8 +303,6 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             finished_at=timezone.now(),
             **task_data,
         )
-        if rows != 1:
-            raise RuntimeError(_("Attempt to mark a task canceled that is not in canceling state."))
         with suppress(AttributeError):
             del self.state
         with suppress(AttributeError):
@@ -343,6 +311,18 @@ class Task(BaseModel, AutoAddObjPermsMixin):
             del self.finished_at
         with suppress(AttributeError):
             del self.error
+        if rows != 1:
+            raise RuntimeError(
+                _("Attempt to set not canceling task {} to canceled from '{}'.").format(
+                    self.pk, self.state
+                )
+            )
+
+    def unblock(self):
+        # This should be safe to be called without holding the lock.
+        Task.objects.filter(pk=self.pk).update(unblocked_at=timezone.now())
+        with suppress(AttributeError):
+            del self.unblocked_at
 
     # Example taken from here:
     # https://docs.djangoproject.com/en/3.2/ref/models/instances/#refreshing-objects-from-database
@@ -351,17 +331,25 @@ class Task(BaseModel, AutoAddObjPermsMixin):
         # loaded.
         if fields is not None:
             fields = set(fields)
-            deferred_fields = self.get_deferred_fields()
-            # If any deferred field is going to be loaded
+            deferred_fields = {
+                field for field in self.get_deferred_fields() if not field.startswith("enc_")
+            }
+            # If any state related deferred field is going to be loaded
             if fields.intersection(deferred_fields):
                 # then load all of them
                 fields = fields.union(deferred_fields)
         super().refresh_from_db(using, fields, **kwargs)
 
     class Meta:
-        indexes = [models.Index(fields=["pulp_created"])]
+        indexes = [
+            models.Index(fields=["pulp_created"]),
+            models.Index(fields=["unblocked_at"]),
+            models.Index(fields=["state"]),
+            models.Index(fields=["state", "pulp_created"]),
+        ]
         permissions = [
             ("manage_roles_task", "Can manage role assignments on task"),
+            ("view_task_profile_artifacts", "Can view profile data for task"),
         ]
 
 

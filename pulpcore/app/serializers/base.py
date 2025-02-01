@@ -15,7 +15,6 @@ from django.db import IntegrityError
 from django.db.models import Model
 from drf_queryfields.mixins import QueryFieldsMixin
 from rest_framework import serializers
-from rest_framework.fields import get_attribute
 from rest_framework.validators import UniqueValidator
 from rest_framework_nested.relations import (
     NestedHyperlinkedIdentityField,
@@ -35,6 +34,9 @@ from pulpcore.app.util import (
     get_viewset_for_model,
     get_request_without_query_params,
     get_domain,
+    reverse,
+    get_prn,
+    resolve_prn,
 )
 
 
@@ -44,30 +46,38 @@ log = getLogger(__name__)
 # Field mixins
 
 
-def _reverse(reverse, request, obj):
+def _reverse(obj):
     """Include domain-path in reverse call if DOMAIN_ENABLED."""
 
     if settings.DOMAIN_ENABLED:
 
         @functools.wraps(reverse)
-        def _patched_reverse(viewname, args=None, kwargs=None, **extra):
+        def _patched_reverse(viewname, request=None, args=None, kwargs=None, **extra):
             kwargs = kwargs or {}
             domain_name = obj.pulp_domain.name if hasattr(obj, "pulp_domain") else "default"
             kwargs["pulp_domain"] = domain_name
-            return reverse(viewname, args=args, kwargs=kwargs, **extra)
+            return reverse(viewname, request=request, args=args, kwargs=kwargs, **extra)
 
         return _patched_reverse
 
     return reverse
 
 
-class HrefFieldMixin:
-    """A mixin to configure related fields to generate relative hrefs."""
+class HrefPrnFieldMixin:
+    """A mixin to configure related fields to generate relative hrefs and accept PRNs."""
 
     def get_url(self, obj, view_name, request, *args, **kwargs):
-        # Removes the request from the arguments to display relative hrefs.
-        self.reverse = _reverse(self.reverse, request, obj)
-        return super().get_url(obj, view_name, None, *args, **kwargs)
+        # Use the Pulp reverse method to display relative hrefs.
+        self.reverse = _reverse(obj)
+        return super().get_url(obj, view_name, request, *args, **kwargs)
+
+    def to_internal_value(self, data):
+        # Properly also handle PRNs as values by converting them to URLs first
+        if data.startswith("prn:"):
+            model, pk = resolve_prn(data)
+            obj = model(pk=pk) if self.use_pk_only_optimization() else model.objects.get(pk=pk)
+            data = self.get_url(obj, self.view_name, self.context.get("request"), None)
+        return super().to_internal_value(data)
 
 
 class _MatchingRegexViewName(object):
@@ -90,7 +100,7 @@ class _MatchingRegexViewName(object):
         return re.fullmatch(self.pattern, other) is not None
 
 
-class _DetailFieldMixin(HrefFieldMixin):
+class _DetailFieldMixin(HrefPrnFieldMixin):
     """Mixin class containing code common to DetailIdentityField and DetailRelatedField"""
 
     def __init__(self, view_name=None, view_name_pattern=None, **kwargs):
@@ -132,7 +142,7 @@ class _DetailFieldMixin(HrefFieldMixin):
 
 
 class IdentityField(
-    HrefFieldMixin,
+    HrefPrnFieldMixin,
     serializers.HyperlinkedIdentityField,
 ):
     """IdentityField for use in the pulp_href field of non-Master/Detail Serializers.
@@ -142,13 +152,24 @@ class IdentityField(
 
 
 class RelatedField(
-    HrefFieldMixin,
+    HrefPrnFieldMixin,
     serializers.HyperlinkedRelatedField,
 ):
     """RelatedField when relating to non-Master/Detail models
 
     When using this field on a serializer, it will serialize the related resource as a relative URL.
     """
+
+
+class PRNField(serializers.StringRelatedField):
+    """A special IdentityField that shows any object's PRN."""
+
+    def __init__(self, **kwargs):
+        kwargs["source"] = "*"
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        return get_prn(instance=value)
 
 
 PKObject = namedtuple("PKObject", ["pk"])
@@ -165,14 +186,19 @@ class RelatedResourceField(RelatedField):
     Specific implementation requires the model to be defined in the Meta:.
     """
 
-    def repo_ver_url(self, repo_ver):
+    def repo_ver_url(self, repo_ver, request=None):
         repo_model = Repository.get_model_for_pulp_type(repo_ver.repository.pulp_type)
         view_name = get_view_name_for_model(repo_model, "detail")
         obj = PKDomainObject(pk=repo_ver.repository.pk, pulp_domain=self.context["pulp_domain"])
-        repo_url = self.get_url(obj, view_name, request=None, format=None)
+        repo_url = self.get_url(obj, view_name, request=request, format=None)
         return f"{repo_url}versions/{repo_ver.number}/"
 
     def to_representation(self, data):
+        # query parameters can be ignored because we are looking just for 'pulp_href'; still,
+        # we need to use the request object due to contextual references required by some
+        # serializers
+        request = get_request_without_query_params(self.context)
+
         # Try to use optimized lookup to avoid DB if content_type has been already been fetched
         if GenericRelationModel.content_type.is_cached(data):
             model = data.content_type.model_class()
@@ -181,8 +207,8 @@ class RelatedResourceField(RelatedField):
                 repo_ver_mapping = self.context.get("repo_ver_mapping")
                 if repo_ver_mapping is not None:
                     if repo_ver := repo_ver_mapping.get(data.object_id):
-                        return self.repo_ver_url(repo_ver)
-                    return None
+                        return self.repo_ver_url(repo_ver, request=request)
+                    return "<unavailable>"
             else:
                 try:
                     view_name = get_view_name_for_model(model, "detail")
@@ -196,24 +222,19 @@ class RelatedResourceField(RelatedField):
                     else:
                         obj = PKObject(pk=data.object_id)
                     try:
-                        return self.get_url(obj, view_name, request=None, format=None)
+                        return self.get_url(obj, view_name, request=request, format=None)
                     except NoReverseMatch:
                         pass
 
         # Fallback onto normal lookup:
         # If the content object was deleted
         if data.content_object is None:
-            return None
+            return "<unavailable>"
         try:
             if not data.content_object.complete:
-                return None
+                return "<unavailable>"
         except AttributeError:
             pass
-
-        # query parameters can be ignored because we are looking just for 'pulp_href'; still,
-        # we need to use the request object due to contextual references required by some
-        # serializers
-        request = get_request_without_query_params(self.context)
 
         viewset = get_viewset_for_model(data.content_object)
         serializer = viewset.serializer_class(data.content_object, context={"request": request})
@@ -255,7 +276,7 @@ class DetailRelatedField(_DetailFieldMixin, serializers.HyperlinkedRelatedField)
         return False
 
 
-class NestedIdentityField(HrefFieldMixin, NestedHyperlinkedIdentityField):
+class NestedIdentityField(HrefPrnFieldMixin, NestedHyperlinkedIdentityField):
     """NestedIdentityField for use with nested resources.
 
     When using this field in a serializer, it serializes the resource as a relative URL.
@@ -263,7 +284,7 @@ class NestedIdentityField(HrefFieldMixin, NestedHyperlinkedIdentityField):
 
 
 class NestedRelatedField(
-    HrefFieldMixin,
+    HrefPrnFieldMixin,
     NestedHyperlinkedRelatedField,
 ):
     """NestedRelatedField for use when relating to nested resources.
@@ -317,7 +338,7 @@ class ValidateFieldsMixin:
                 ):
                     if current_domain.pulp_id != domain_id:
                         raise serializers.ValidationError(
-                            _("Objects must all be apart of the {} domain.").format(
+                            _("Objects must all be a part of the {} domain.").format(
                                 current_domain.name
                             )
                         )
@@ -341,14 +362,13 @@ class HiddenFieldsMixin(serializers.Serializer):
         hidden_fields = []
 
         # returns false if field is "" or None
-        def _is_set(field_name):
-            field_value = get_attribute(obj, [field_name])
+        def _is_set(field):
+            field_value = field.get_attribute(obj)
             return field_value != "" and field_value is not None
 
-        fields = self.get_fields()
-        for field_name in fields:
-            if fields[field_name].write_only:
-                hidden_fields.append({"name": field_name, "is_set": _is_set(field_name)})
+        for field_name, field in self.fields.items():
+            if field.write_only and not isinstance(field, serializers.HiddenField):
+                hidden_fields.append({"name": field_name, "is_set": _is_set(field)})
 
         return hidden_fields
 
@@ -358,6 +378,7 @@ class GetOrCreateSerializerMixin:
 
     @classmethod
     def get_or_create(cls, natural_key, default_values=None):
+        result = None
         try:
             result = cls.Meta.model.objects.get(**natural_key)
         except ObjectDoesNotExist:
@@ -365,11 +386,28 @@ class GetOrCreateSerializerMixin:
             if default_values:
                 data.update(default_values)
             data.update(natural_key)
+            if "pulp_domain" in natural_key:
+                del data["pulp_domain"]
             serializer = cls(data=data)
             try:
                 serializer.is_valid(raise_exception=True)
-                result = serializer.create(serializer.validated_data)
-            except (IntegrityError, serializers.ValidationError):
+            except serializers.ValidationError as e:
+                returned_codes = e.get_codes().values()
+                error_codes = set(["required", "invalid"])
+                all_codes = []
+                for c in returned_codes:
+                    all_codes.extend(c)
+                if error_codes.intersection(all_codes):
+                    # validation failed because fields are invalid, missing
+                    raise e
+                # recover from a race condition, where another thread just created the object
+                # validation failed with 400 'unique' error code only
+                result = cls.Meta.model.objects.get(**natural_key)
+            try:
+                if "pulp_domain" in natural_key:
+                    serializer.validated_data["pulp_domain"] = natural_key["pulp_domain"]
+                result = result or serializer.create(serializer.validated_data)
+            except IntegrityError:
                 # recover from a race condition, where another thread just created the object
                 result = cls.Meta.model.objects.get(**natural_key)
         return result
@@ -390,7 +428,7 @@ class DomainUniqueValidator(UniqueValidator):
 class ModelSerializer(
     ValidateFieldsMixin, QueryFieldsMixin, serializers.HyperlinkedModelSerializer
 ):
-    """Base serializer for use with :class:`pulpcore.app.models.Model`
+    """Base serializer for use with [pulpcore.app.models.Model][]
 
     This ensures that all Serializers provide values for the 'pulp_href` field.
 
@@ -404,9 +442,18 @@ class ModelSerializer(
     exclude_arg_name = "exclude_fields"
 
     class Meta:
-        fields = ("pulp_href", "pulp_created")
+        fields = ("pulp_href", "prn", "pulp_created", "pulp_last_updated")
 
+    prn = PRNField(help_text=_("The Pulp Resource Name (PRN)."))
     pulp_created = serializers.DateTimeField(help_text=_("Timestamp of creation."), read_only=True)
+    pulp_last_updated = serializers.DateTimeField(
+        help_text=_(
+            "Timestamp of the last time this resource was updated. Note: for immutable "
+            "resources - like content, repository versions, and publication - pulp_created and "
+            "pulp_last_updated dates will be the same."
+        ),
+        read_only=True,
+    )
 
     def _validate_relative_path(self, path):
         """
@@ -438,6 +485,16 @@ class ModelSerializer(
             )
 
         return path
+
+    def save(self, **kwargs):
+        try:
+            return super().save(**kwargs)
+        except IntegrityError as e:
+            # Concurrent request got by the unique validator on the serializer
+            if "unique" in str(e):
+                # Run validation again to properly raise an unique-ValidationError
+                self.run_validation(self.initial_data)
+            raise e
 
     def __init_subclass__(cls, **kwargs):
         """Set default attributes in subclasses.
@@ -494,3 +551,33 @@ class TaskGroupOperationResponseSerializer(serializers.Serializer):
         view_name="task-groups-detail",
         allow_null=False,
     )
+
+
+class SetLabelSerializer(serializers.Serializer):
+    """
+    Serializer for synchronously setting a label.
+    """
+
+    key = serializers.SlugField(required=True)
+    value = serializers.CharField(required=True, allow_null=True, allow_blank=True)
+
+
+class UnsetLabelSerializer(serializers.Serializer):
+    """
+    Serializer for synchronously setting a label.
+    """
+
+    key = serializers.SlugField(required=True)
+    value = serializers.CharField(read_only=True)
+
+    def validate_key(self, value):
+        if value not in self.context["content_object"].pulp_labels:
+            raise serializers.ValidationError(
+                _("Label '{key}' is not set on the object.").format(key=value)
+            )
+        return value
+
+    def validate(self, data):
+        data = super().validate(data)
+        data["value"] = self.context["content_object"].pulp_labels[data["key"]]
+        return data

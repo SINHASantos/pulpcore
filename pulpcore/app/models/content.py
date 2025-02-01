@@ -1,11 +1,13 @@
 """
 Content related Django models.
 """
+
 from gettext import gettext as _
 
 import asyncio
 import datetime
 import json
+import os
 import tempfile
 import shutil
 import subprocess
@@ -166,7 +168,7 @@ class HandleTempFilesMixin:
         transaction.on_commit(partial(self.file.delete, save=False))
 
 
-class ArtifactManager(BulkCreateManager):
+class ArtifactQuerySet(BulkTouchQuerySet):
     def orphaned(self, orphan_protection_time):
         """Returns set of orphaned artifacts that are ready to be cleaned up."""
         domain_pk = get_domain_pk()
@@ -226,7 +228,7 @@ class Artifact(HandleTempFilesMixin, BaseModel):
     timestamp_of_interest = models.DateTimeField(auto_now=True)
     pulp_domain = models.ForeignKey("Domain", default=get_domain_pk, on_delete=models.PROTECT)
 
-    objects = ArtifactManager.from_queryset(BulkTouchQuerySet)()
+    objects = BulkCreateManager.from_queryset(ArtifactQuerySet)()
 
     # All available digest fields ordered by algorithm strength.
     DIGEST_FIELDS = _DIGEST_FIELDS
@@ -310,10 +312,10 @@ class Artifact(HandleTempFilesMixin, BaseModel):
         Initialize an in-memory Artifact from a file, and validate digest and size info.
 
         This accepts both a path to a file on-disk or a
-        :class:`~pulpcore.app.files.PulpTemporaryUploadedFile`.
+        [pulpcore.app.files.PulpTemporaryUploadedFile][].
 
         Args:
-            file (:class:`~pulpcore.app.files.PulpTemporaryUploadedFile` or str): The
+            file ([pulpcore.app.files.PulpTemporaryUploadedFile][] or str): The
                 PulpTemporaryUploadedFile to create the Artifact from or a string with the full path
                 to the file on disk.
             expected_digests (dict): Keyed on the algorithm name provided by hashlib and stores the
@@ -321,14 +323,14 @@ class Artifact(HandleTempFilesMixin, BaseModel):
             expected_size (int): The number of bytes the download is expected to have.
 
         Raises:
-            :class:`~pulpcore.exceptions.DigestValidationError`: When any of the ``expected_digest``
+            [pulpcore.exceptions.DigestValidationError][]: When any of the ``expected_digest``
                 values don't match the digest of the data
-            :class:`~pulpcore.exceptions.SizeValidationError`: When the ``expected_size`` value
+            [pulpcore.exceptions.SizeValidationError][]: When the ``expected_size`` value
                 doesn't match the size of the data
-            :class:`~pulpcore.exceptions.UnsupportedDigestValidationError`: When any of the
+            [pulpcore.exceptions.UnsupportedDigestValidationError][]: When any of the
                 ``expected_digest`` algorithms aren't in the ALLOWED_CONTENT_CHECKSUMS list
         Returns:
-            An in-memory, unsaved :class:`~pulpcore.plugin.models.Artifact`
+            An in-memory, unsaved [pulpcore.plugin.models.Artifact][]
         """
         if isinstance(file, str):
             with open(file, "rb") as f:
@@ -373,7 +375,7 @@ class Artifact(HandleTempFilesMixin, BaseModel):
         Creates an Artifact from PulpTemporaryFile.
 
         Returns:
-            An saved :class:`~pulpcore.plugin.models.Artifact`
+            An saved [pulpcore.plugin.models.Artifact][]
         """
         artifact_file = temp_file.file.open()
         with tempfile.NamedTemporaryFile("wb") as new_file:
@@ -427,10 +429,10 @@ class PulpTemporaryFile(HandleTempFilesMixin, BaseModel):
         Initialize an in-memory PulpTemporaryFile from a file, and validate digest and size info.
 
         This accepts both a path to a file on-disk or a
-        :class:`~pulpcore.app.files.PulpTemporaryUploadedFile`.
+        [pulpcore.app.files.PulpTemporaryUploadedFile][].
 
         Args:
-            file (:class:`~pulpcore.app.files.PulpTemporaryUploadedFile` or str): The
+            file ([pulpcore.app.files.PulpTemporaryUploadedFile][] or str): The
                 PulpTemporaryUploadedFile to create the PulpTemporaryFile from or a string with the
                 full path to the file on disk.
             expected_digests (dict): Keyed on the algorithm name provided by hashlib and stores the
@@ -438,15 +440,15 @@ class PulpTemporaryFile(HandleTempFilesMixin, BaseModel):
             expected_size (int): The number of bytes the download is expected to have.
 
         Raises:
-            :class:`~pulpcore.exceptions.DigestValidationError`: When any of the ``expected_digest``
+            [pulpcore.exceptions.DigestValidationError][]: When any of the ``expected_digest``
                 values don't match the digest of the data
-            :class:`~pulpcore.exceptions.SizeValidationError`: When the ``expected_size`` value
+            [pulpcore.exceptions.SizeValidationError][]: When the ``expected_size`` value
                 doesn't match the size of the data
-            :class:`~pulpcore.exceptions.UnsupportedDigestValidationError`: When any of the
+            [pulpcore.exceptions.UnsupportedDigestValidationError][]: When any of the
                 ``expected_digest`` algorithms aren't in the ALLOWED_CONTENT_CHECKSUMS list
 
         Returns:
-            An in-memory, unsaved :class:`~pulpcore.plugin.models.PulpTemporaryFile`
+            An in-memory, unsaved [pulpcore.plugin.models.PulpTemporaryFile][]
         """
         if not expected_digests and not expected_size:
             return PulpTemporaryFile(file=file)
@@ -485,7 +487,7 @@ class PulpTemporaryFile(HandleTempFilesMixin, BaseModel):
         return PulpTemporaryFile(file=file)
 
 
-class ContentManager(BulkCreateManager):
+class ContentQuerySet(BulkTouchQuerySet):
     def orphaned(self, orphan_protection_time, content_pks=None):
         """Returns set of orphaned content that is ready to be cleaned up."""
         expiration = now() - datetime.timedelta(minutes=orphan_protection_time)
@@ -504,7 +506,7 @@ class ContentManager(BulkCreateManager):
         )
 
 
-ContentManager = ContentManager.from_queryset(BulkTouchQuerySet)
+ContentManager = BulkCreateManager.from_queryset(ContentQuerySet)
 
 
 class Content(MasterModel, QueryMixin):
@@ -599,15 +601,15 @@ class Content(MasterModel, QueryMixin):
             return FileContent(relative_path=relative_path, digest=artifact.sha256)
 
         Args:
-            artifact (:class:`~pulpcore.plugin.models.Artifact`): An instance of an Artifact
+            artifact (pulpcore.plugin.models.Artifact) An instance of an Artifact
             relative_path (str): Relative path for the content
 
         Raises:
             ValueError: If relative_path starts with a '/'.
 
         Returns:
-            An un-saved instance of :class:`~pulpcore.plugin.models.Content` sub-class. Or a
-            tuple of an un-saved instance of :class:`~pulpcore.plugin.models.Content` and a dict
+            An un-saved instance of [pulpcore.plugin.models.Content][] sub-class. Or a
+            tuple of an un-saved instance of [pulpcore.plugin.models.Content][] and a dict
             of form [relative_path:str, Optional[artifact:`~pulpcore.plugin.models.Artifact`]]
         """
         raise NotImplementedError()
@@ -635,6 +637,7 @@ class ContentArtifact(BaseModel, QueryMixin):
 
     class Meta:
         unique_together = ("content", "relative_path")
+        indexes = [models.Index(fields=["relative_path"])]
 
     @staticmethod
     def sort_key(ca):
@@ -650,7 +653,7 @@ class ContentArtifact(BaseModel, QueryMixin):
         This method produces a key based on the content/artifact represented by the CA.
 
         Args:
-            ca (:class:`~pulpcore.plugin.models.ContentArtifact`): The CA we need a key for
+            ca (pulpcore.plugin.models.ContentArtifact) The CA we need a key for
 
         Returns:
             a tuple of (str(content-key), str(artifact-key)) that can be reliably sorted on
@@ -700,24 +703,26 @@ class RemoteArtifact(BaseModel, QueryMixin):
         sha256 (models.CharField): The expected SHA-256 checksum of the file.
         sha384 (models.CharField): The expected SHA-384 checksum of the file.
         sha512 (models.CharField): The expected SHA-512 checksum of the file.
+        failed_at (models.DateTimeField): The datetime of last download attempt failure.
 
     Relations:
 
-        content_artifact (:class:`pulpcore.app.models.ForeignKey`):
+        content_artifact (pulpcore.app.models.ForeignKey)
             ContentArtifact associated with this RemoteArtifact.
-        remote (:class:`django.db.models.ForeignKey`): Remote that created the
+        remote (django.db.models.ForeignKey) Remote that created the
             RemoteArtifact.
-        pulp_domain (:class:`django.db.models.ForeignKey`): Domain the RemoteArtifact is a part of.
+        pulp_domain (django.db.models.ForeignKey) Domain the RemoteArtifact is a part of.
     """
 
     url = models.TextField(validators=[validators.URLValidator])
     size = models.BigIntegerField(null=True)
-    md5 = models.CharField(max_length=32, null=True)
-    sha1 = models.CharField(max_length=40, null=True)
-    sha224 = models.CharField(max_length=56, null=True)
-    sha256 = models.CharField(max_length=64, null=True)
-    sha384 = models.CharField(max_length=96, null=True)
-    sha512 = models.CharField(max_length=128, null=True)
+    md5 = models.CharField(max_length=32, null=True, db_index=True)
+    sha1 = models.CharField(max_length=40, null=True, db_index=True)
+    sha224 = models.CharField(max_length=56, null=True, db_index=True)
+    sha256 = models.CharField(max_length=64, null=True, db_index=True)
+    sha384 = models.CharField(max_length=96, null=True, db_index=True)
+    sha512 = models.CharField(max_length=128, null=True, db_index=True)
+    failed_at = models.DateTimeField(null=True)
 
     content_artifact = models.ForeignKey(ContentArtifact, on_delete=models.CASCADE)
     remote = models.ForeignKey("Remote", on_delete=models.CASCADE)
@@ -781,7 +786,7 @@ class SigningService(BaseModel):
         }
         if env_vars:
             env.update(env_vars)
-        return env
+        return {**os.environ, **env}
 
     def sign(self, filename, env_vars=None):
         """

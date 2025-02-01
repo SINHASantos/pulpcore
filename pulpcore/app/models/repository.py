@@ -1,6 +1,7 @@
 """
 Repository related Django models.
 """
+
 from contextlib import suppress
 from gettext import gettext as _
 from os import path
@@ -14,26 +15,25 @@ from django.contrib.postgres.fields import HStoreField
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import F, Func, Q, Value
-from django.urls import reverse
 from django_lifecycle import AFTER_UPDATE, BEFORE_DELETE, hook
 from rest_framework.exceptions import APIException
 
 from pulpcore.app.util import (
     batch_qs,
-    get_url,
+    get_prn,
     get_view_name_for_model,
-    get_domain,
     get_domain_pk,
     cache_key,
+    reverse,
 )
-from pulpcore.constants import ALL_KNOWN_CONTENT_CHECKSUMS
+from pulpcore.constants import ALL_KNOWN_CONTENT_CHECKSUMS, PROTECTED_REPO_VERSION_MESSAGE
 from pulpcore.download.factory import DownloaderFactory
 from pulpcore.exceptions import ResourceImmutableError
 
 from pulpcore.cache import Cache
 
 from .base import MasterModel, BaseModel
-from .content import Artifact, Content
+from .content import Artifact, Content, ContentArtifact, RemoteArtifact
 from .fields import EncryptedTextField
 from .task import CreatedResource, Task
 
@@ -82,6 +82,35 @@ class Repository(MasterModel):
         unique_together = ("name", "pulp_domain")
         verbose_name_plural = "repositories"
 
+    @property
+    def disk_size(self):
+        """Returns the approximate size on disk for all artifacts stored across all versions."""
+        all_content = (
+            RepositoryContent.objects.filter(repository=self)
+            .distinct("content")
+            .values_list("content")
+        )
+        return (
+            Artifact.objects.filter(content__in=all_content)
+            .distinct()
+            .aggregate(size=models.Sum("size", default=0))["size"]
+        )
+
+    @property
+    def on_demand_size(self):
+        """Returns the approximate size of all on-demand artifacts stored across all versions."""
+        all_content = (
+            RepositoryContent.objects.filter(repository=self)
+            .distinct("content")
+            .values_list("content")
+        )
+        on_demand_ca = ContentArtifact.objects.filter(content__in=all_content, artifact=None)
+        # Aggregate does not work with distinct("fields") so sum must be done manually
+        ras = RemoteArtifact.objects.filter(
+            content_artifact__in=on_demand_ca, size__isnull=False
+        ).distinct("content_artifact")
+        return sum(ras.values_list("size", flat=True))
+
     def on_new_version(self, version):
         """Called after a new repository version has been created.
 
@@ -111,9 +140,9 @@ class Repository(MasterModel):
                 if task_id is None:
                     return
 
-                repository_url = Value(get_url(self))
+                repository_prn = Value(get_prn(instance=self))
                 update_func = Func(
-                    F("reserved_resources_record"), repository_url, function="ARRAY_APPEND"
+                    F("reserved_resources_record"), repository_prn, function="ARRAY_APPEND"
                 )
                 updated = Task.objects.filter(pk=task_id).update(
                     reserved_resources_record=update_func
@@ -176,7 +205,7 @@ class Repository(MasterModel):
 
         This method should be overridden by plugin writers for an opportunity for plugin input. This
         method is intended to be called with the incomplete
-        :class:`pulpcore.app.models.RepositoryVersion` to validate or modify the content.
+        [pulpcore.app.models.RepositoryVersion][] to validate or modify the content.
 
         This method does not adjust the value of complete, or save the `RepositoryVersion` itself.
         Its intent is to allow the plugin writer an opportunity for plugin input before any other
@@ -195,7 +224,7 @@ class Repository(MasterModel):
 
         This method should be overridden by plugin writers for an opportunity for plugin input. This
         method is intended to be called with the incomplete
-        :class:`pulpcore.app.models.RepositoryVersion` to validate or modify the content.
+        [pulpcore.app.models.RepositoryVersion][] to validate or modify the content.
 
         This method does not adjust the value of complete, or save the `RepositoryVersion` itself.
         Its intent is to allow the plugin writer an opportunity for plugin input before pulpcore
@@ -250,6 +279,22 @@ class Repository(MasterModel):
         return (self.name,)
 
     @staticmethod
+    def on_demand_artifacts_for_version(version):
+        """
+        Returns the remote artifacts of on-demand content for a repository version.
+
+        Provides a method that plugins can override since RepositoryVersions aren't typed.
+        Note: this only returns remote artifacts that have a non-null size.
+
+        Args:
+            version (pulpcore.app.models.RepositoryVersion): to get the remote artifacts for.
+        Returns:
+            django.db.models.QuerySet: The remote artifacts that are contained within this version.
+        """
+        on_demand_ca = ContentArtifact.objects.filter(content__in=version.content, artifact=None)
+        return RemoteArtifact.objects.filter(content_artifact__in=on_demand_ca, size__isnull=False)
+
+    @staticmethod
     def artifacts_for_version(version):
         """
         Return the artifacts for a repository version.
@@ -263,6 +308,42 @@ class Repository(MasterModel):
             django.db.models.QuerySet: The artifacts that are contained within this version.
         """
         return Artifact.objects.filter(content__pk__in=version.content)
+
+    def protected_versions(self):
+        """
+        Return repository versions that are protected.
+
+        A protected version is one that is being served by a distro directly or via publication.
+
+        Returns:
+            django.db.models.QuerySet: Repo versions which are protected.
+        """
+        from .publication import Distribution, Publication
+
+        # find all repo versions set on a distribution
+        qs = self.versions.filter(pk__in=Distribution.objects.values_list("repository_version_id"))
+
+        # find all repo versions with publications set on a distribution
+        qs |= self.versions.filter(
+            publication__pk__in=Distribution.objects.values_list("publication_id")
+        )
+
+        if distro := Distribution.objects.filter(repository=self.pk).first():
+            if distro.detail_model().SERVE_FROM_PUBLICATION:
+                # if the distro serves publications, protect the latest published repo version
+                version = self.versions.filter(
+                    pk__in=Publication.objects.filter(complete=True).values_list(
+                        "repository_version_id"
+                    )
+                ).last()
+            else:
+                # if the distro does not serve publications, use the latest repo version
+                version = self.latest_version()
+
+            if version:
+                qs |= self.versions.filter(pk=version.pk)
+
+        return qs.distinct()
 
     @hook(AFTER_UPDATE, when="retain_repo_versions", has_changed=True)
     def _cleanup_old_versions_hook(self):
@@ -280,14 +361,53 @@ class Repository(MasterModel):
                 _("Attempt to cleanup old versions, while a new version is in flight.")
             )
         if self.retain_repo_versions:
-            # Consider only completed versions for cleanup
-            for version in self.versions.complete().order_by("-number")[
-                self.retain_repo_versions :
-            ]:
+            # Consider only completed versions that aren't protected for cleanup
+            versions = self.versions.complete().exclude(pk__in=self.protected_versions())
+            for version in versions.order_by("-number")[self.retain_repo_versions :]:
                 _logger.info(
                     "Deleting repository version {} due to version retention limit.".format(version)
                 )
                 version.delete()
+
+    def delete(self, **kwargs):
+        """
+        Delete the repository.
+
+        Args:
+            **kwargs (dict): Delete options.
+        """
+        from .publication import Publication, PublishedArtifact  # circular import avoidance
+
+        # The purpose is to avoid the memory spike caused by the deletion of an object at
+        # the apex of a large tree of cascading deletes. As per the Django documentation [0],
+        # cascading deletes are handled by Django and require objects to be loaded into
+        # memory. If the tree of objects is sufficiently large, this can result in a fatal
+        # memory spike.
+        #
+        # Therefore, we manually delete the objects which we know we have many thousands of
+        # first, to make the cascade delete managable.
+        #
+        # [0] https://docs.djangoproject.com/en/4.2/ref/models/querysets/#delete
+        with transaction.atomic():
+            repo_versions = RepositoryVersion.objects.filter(repository=self)
+            repo_contents = RepositoryContent.objects.filter(repository=self)
+            publications = Publication.objects.filter(
+                repository_version__in=repo_versions.values_list("pk", flat=True)
+            )
+            published_artifacts = PublishedArtifact.objects.filter(
+                publication__in=publications.values_list("pk", flat=True)
+            )
+
+            # PublishedArtifact and RepositoryContent are the two most numerous object types
+            # PublishedMetadata would be trickier to delete because it's a Content subclass
+            # that is ignored by orphan cleanup, so to delete those in this way would require
+            # manual intervention
+            published_artifacts._raw_delete(published_artifacts.db)
+            repo_contents._raw_delete(repo_contents.db)
+
+            # Anything not deleted manually above will be caught up in Django cascade. Deleting
+            # those ojects manually should keep this operation from being too brutal.
+            return super().delete(**kwargs)
 
     @hook(BEFORE_DELETE)
     def invalidate_cache(self, everything=False):
@@ -315,13 +435,13 @@ class Remote(MasterModel):
     This is meant to be subclassed by plugin authors as an opportunity to provide plugin-specific
     persistent data attributes for a plugin remote subclass.
 
-    This object is a Django model that inherits from :class: `pulpcore.app.models.Remote` which
+    This object is a Django model that inherits from [pulpcore.app.models.Remote][] which
     provides the platform persistent attributes for a remote object. Plugin authors can add
     additional persistent remote data by subclassing this object and adding Django fields. We
     defer to the Django docs on extending this model definition with additional fields.
 
     Validation of the remote is done at the API level by a plugin defined subclass of
-    :class: `pulpcore.plugin.serializers.repository.RemoteSerializer`.
+    [pulpcore.plugin.serializers.repository.RemoteSerializer][].
 
     Fields:
 
@@ -472,19 +592,19 @@ class Remote(MasterModel):
         another class of download is required.
 
         Args:
-            remote_artifact (:class:`~pulpcore.app.models.RemoteArtifact`): The RemoteArtifact to
+            remote_artifact (pulpcore.app.models.RemoteArtifact) The RemoteArtifact to
                 download.
             url (str): The URL to download.
-            download_factory (:class:`~pulpcore.plugin.download.DownloadFactory`): The download
+            download_factory (pulpcore.plugin.download.DownloadFactory) The download
                 factory to be used.
             kwargs (dict): This accepts the parameters of
-                :class:`~pulpcore.plugin.download.BaseDownloader`.
+                [pulpcore.plugin.download.BaseDownloader][].
 
         Raises:
             ValueError: If neither remote_artifact and url are passed, or if both are passed.
 
         Returns:
-            subclass of :class:`~pulpcore.plugin.download.BaseDownloader`: A downloader that
+            subclass of [pulpcore.plugin.download.BaseDownloader][]: A downloader that
             is configured with the remote settings.
         """
         if remote_artifact and url:
@@ -689,7 +809,7 @@ class RepositoryVersion(BaseModel):
         Returns a set of content for a repository version
 
         Args:
-            content_qs (:class:`django.db.models.QuerySet`): The queryset for Content that will be
+            content_qs (django.db.models.QuerySet): The queryset for Content that will be
                 restricted further to the content present in this repository version. If not given,
                 ``Content.objects.all()`` is used (to return over all content types present in the
                 repository version).
@@ -707,7 +827,7 @@ class RepositoryVersion(BaseModel):
         if content_qs is None:
             content_qs = Content.objects
 
-        return content_qs.filter(version_memberships__in=self._content_relationships())
+        return content_qs.filter(pk__in=self._content_relationships().values_list("content_id"))
 
     @property
     def content(self):
@@ -749,11 +869,11 @@ class RepositoryVersion(BaseModel):
               stable results. By default, it is ordered by primary key.
 
         Args:
-            content_qs (:class:`django.db.models.QuerySet`): The queryset for Content that will be
+            content_qs (django.db.models.QuerySet) The queryset for Content that will be
                 restricted further to the content present in this repository version. If not given,
                 ``Content.objects.all()`` is used (to iterate over all content present in the
                 repository version). A plugin may want to use a specific subclass of
-                :class:`~pulpcore.plugin.models.Content` or use e.g. ``filter()`` to select
+                [pulpcore.plugin.models.Content][] or use e.g. ``filter()`` to select
                 a subset of the repository version's content.
             order_by_params (tuple of str): The parameters for the ``order_by`` clause
                 for the content. The Default is ``("pk",)``. This needs to
@@ -764,12 +884,12 @@ class RepositoryVersion(BaseModel):
             batch_size (int): The maximum batch size.
 
         Yields:
-            :class:`django.db.models.QuerySet`: A QuerySet representing a slice of the content.
+            [django.db.models.QuerySet][]: A QuerySet representing a slice of the content.
 
         Example:
             The following code could be used to loop over all ``FileContent`` in
             ``repository_version``. It prefetches the related
-            :class:`~pulpcore.plugin.models.ContentArtifact` instances for every batch::
+            [pulpcore.plugin.models.ContentArtifact][] instances for every batch::
 
                 repository_version = ...
 
@@ -794,6 +914,21 @@ class RepositoryVersion(BaseModel):
             django.db.models.QuerySet: The artifacts that are contained within this version.
         """
         return self.repository.cast().artifacts_for_version(self)
+
+    @property
+    def on_demand_artifacts(self):
+        return self.repository.cast().on_demand_artifacts_for_version(self)
+
+    @property
+    def disk_size(self):
+        """Returns the size on disk of all the artifacts in this repository version."""
+        return self.artifacts.distinct().aggregate(size=models.Sum("size", default=0))["size"]
+
+    @property
+    def on_demand_size(self):
+        """Returns the size of on-demand artifacts in this repository version."""
+        ras = self.on_demand_artifacts.distinct("content_artifact")
+        return sum(ras.values_list("size", flat=True))
 
     def added(self, base_version=None):
         """
@@ -849,8 +984,15 @@ class RepositoryVersion(BaseModel):
         if self.complete:
             raise ResourceImmutableError(self)
 
+        assert (
+            not Content.objects.filter(pk__in=content)
+            .exclude(pulp_domain_id=get_domain_pk())
+            .exists()
+        )
         repo_content = []
-        to_add = set(content.exclude(pk__in=self.content).values_list("pk", flat=True))
+        to_add = set(content.values_list("pk", flat=True)) - set(
+            self.content.values_list("pk", flat=True)
+        )
 
         # Normalize representation if content has already been removed in this version and
         # is re-added: Undo removal by setting version_removed to None.
@@ -888,6 +1030,11 @@ class RepositoryVersion(BaseModel):
 
         if not content or not content.count():
             return
+        assert (
+            not Content.objects.filter(pk__in=content)
+            .exclude(pulp_domain_id=get_domain_pk())
+            .exists()
+        )
 
         # Normalize representation if content has already been added in this version.
         # Undo addition by deleting the RepositoryContent.
@@ -920,10 +1067,11 @@ class RepositoryVersion(BaseModel):
     def next(self):
         """
         Returns:
-            pulpcore.app.models.RepositoryVersion: The next complete RepositoryVersion for the same
-                repository.
+            [pulpcore.app.models.RepositoryVersion][]: The next complete RepositoryVersion
+            for the same repository.
+
         Raises:
-            RepositoryVersion.DoesNotExist: if there is not a RepositoryVersion for the same
+            [RepositoryVersion.DoesNotExist][]: if there is not a RepositoryVersion for the same
                 repository and with a higher "number".
         """
         try:
@@ -1000,6 +1148,12 @@ class RepositoryVersion(BaseModel):
         # Update next version's counts as they have been modified
         next_version._compute_counts()
 
+    @hook(BEFORE_DELETE)
+    def check_protected(self):
+        """Check if a repo version is protected before trying to delete it."""
+        if self in self.repository.protected_versions():
+            raise Exception(PROTECTED_REPO_VERSION_MESSAGE)
+
     def delete(self, **kwargs):
         """
         Deletes a RepositoryVersion
@@ -1008,7 +1162,7 @@ class RepositoryVersion(BaseModel):
         the successor. If version is incomplete, delete and and clean up RepositoryContent,
         CreatedResource, and Repository objects.
 
-        Deletion of a complete RepositoryVersion should be done in a RQ Job.
+        Deletion of a complete RepositoryVersion should be done in a task.
         """
         if self.complete:
             if self.repository.versions.complete().count() <= 1:
@@ -1051,8 +1205,8 @@ class RepositoryVersion(BaseModel):
         """
         Compute and save content unit counts by type.
 
-        Count records are stored as :class:`~pulpcore.app.models.RepositoryVersionContentDetails`.
-        This method deletes existing :class:`~pulpcore.app.models.RepositoryVersionContentDetails`
+        Count records are stored as [pulpcore.app.models.RepositoryVersionContentDetails][].
+        This method deletes existing [pulpcore.app.models.RepositoryVersionContentDetails][]
         objects and makes new ones with each call.
         """
         with transaction.atomic():
@@ -1151,8 +1305,7 @@ class RepositoryVersionContentDetails(models.Model):
     )
     count = models.IntegerField()
 
-    @property
-    def content_href(self):
+    def get_content_href(self, request=None):
         """
         Generate URLs for the content types added, removed, or present in the RepositoryVersion.
 
@@ -1171,11 +1324,8 @@ class RepositoryVersionContentDetails(models.Model):
         ctypes = {c.get_pulp_type(): c for c in repository_model.CONTENT_TYPES}
         ctype_model = ctypes[self.content_type]
         ctype_view = get_view_name_for_model(ctype_model, "list")
-        kwargs = {}
-        if settings.DOMAIN_ENABLED:
-            kwargs["pulp_domain"] = get_domain().name
         try:
-            ctype_url = reverse(ctype_view, kwargs=kwargs)
+            ctype_url = reverse(ctype_view, request=request)
         except django.urls.exceptions.NoReverseMatch:
             # We've hit a content type for which there is no viewset.
             # There's nothing we can do here, except to skip it.
@@ -1183,7 +1333,7 @@ class RepositoryVersionContentDetails(models.Model):
 
         repository_view = get_view_name_for_model(repository_model, "list")
 
-        repository_url = reverse(repository_view, kwargs=kwargs)
+        repository_url = reverse(repository_view, request=request)
         rv_href = (
             repository_url
             + str(self.repository_version.repository_id)
@@ -1197,3 +1347,5 @@ class RepositoryVersionContentDetails(models.Model):
             partial_url_str = "{base}?repository_version_removed={rv_href}"
         full_url = partial_url_str.format(base=ctype_url, rv_href=rv_href)
         return full_url
+
+    content_href = property(get_content_href)

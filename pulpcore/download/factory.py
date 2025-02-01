@@ -5,7 +5,6 @@ import copy
 from gettext import gettext as _
 from multidict import MultiDict
 import platform
-from pkg_resources import get_distribution
 import ssl
 import sys
 from tempfile import NamedTemporaryFile
@@ -13,6 +12,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from pulpcore.app.apps import PulpAppConfig
 from .http import HttpDownloader
 from .file import FileDownloader
 
@@ -48,16 +48,12 @@ class DownloaderFactory:
     http://aiohttp.readthedocs.io/en/stable/client_quickstart.html#timeouts Behaviorally, it should
     allow for an active download to be arbitrarily long, while still detecting dead or closed
     sessions even when TCPKeepAlive is disabled.
-
-    Also for http and https urls, even though HTTP 1.1 is used, the TCP connection is setup and
-    closed with each request. This is done for compatibility reasons due to various issues related
-    to session continuation implementation in various servers.
     """
 
     def __init__(self, remote, downloader_overrides=None):
         """
         Args:
-            remote (:class:`~pulpcore.plugin.models.Remote`): The remote used to populate
+            remote (pulpcore.plugin.models.Remote) The remote used to populate
                 downloader settings.
             downloader_overrides (dict): Keyed on a scheme name, e.g. 'https' or 'ftp' and the value
                 is the downloader class to be used for that scheme, e.g.
@@ -84,7 +80,7 @@ class DownloaderFactory:
         """
         Produce a User-Agent string to identify Pulp and relevant system info.
         """
-        pulp_version = get_distribution("pulpcore").version
+        pulp_version = PulpAppConfig.version
         python = "{} {}.{}.{}-{}{}".format(sys.implementation.name, *sys.version_info)
         uname = platform.uname()
         system = f"{uname.system} {uname.machine}"
@@ -95,14 +91,14 @@ class DownloaderFactory:
 
     def _make_aiohttp_session_from_remote(self):
         """
-        Build a :class:`aiohttp.ClientSession` from the remote's settings and timing settings.
+        Build a [aiohttp.ClientSession][] from the remote's settings and timing settings.
 
         This method is what provides the force_close of the TCP connection with each request.
 
         Returns:
-            :class:`aiohttp.ClientSession`
+            [aiohttp.ClientSession][]
         """
-        tcp_conn_opts = {"force_close": True}
+        tcp_conn_opts = {}
 
         sslcontext = None
         if self._remote.ca_cert:
@@ -124,6 +120,8 @@ class DownloaderFactory:
             sslcontext.verify_mode = ssl.CERT_NONE
         if sslcontext:
             tcp_conn_opts["ssl_context"] = sslcontext
+            # Trust the system-known CA certs, not just the end-remote CA
+            sslcontext.load_default_certs()
 
         headers = MultiDict({"User-Agent": DownloaderFactory.user_agent()})
         if self._remote.headers is not None:
@@ -133,17 +131,20 @@ class DownloaderFactory:
                     headers["User-Agent"] = f"{headers['User-Agent']}, {user_agent_header}"
                 headers.extend(header_dict)
 
-        conn = aiohttp.TCPConnector(**tcp_conn_opts)
-        total = self._remote.total_timeout
-        sock_connect = self._remote.sock_connect_timeout
-        sock_read = self._remote.sock_read_timeout
-        connect = self._remote.connect_timeout
-
         timeout = aiohttp.ClientTimeout(
-            total=total, sock_connect=sock_connect, sock_read=sock_read, connect=connect
+            total=self._remote.total_timeout,
+            sock_connect=self._remote.sock_connect_timeout,
+            sock_read=self._remote.sock_read_timeout,
+            connect=self._remote.connect_timeout,
         )
+        # TCPConnector is supposed to be instanciated in a running loop.
+        # I don't see why...
+        # https://github.com/aio-libs/aiohttp/pull/3372
         return aiohttp.ClientSession(
-            connector=conn, timeout=timeout, headers=headers, requote_redirect_url=False
+            connector=aiohttp.TCPConnector(loop=asyncio.get_event_loop(), **tcp_conn_opts),
+            timeout=timeout,
+            headers=headers,
+            requote_redirect_url=False,
         )
 
     def build(self, url, **kwargs):
@@ -155,10 +156,10 @@ class DownloaderFactory:
         Args:
             url (str): The download URL.
             kwargs (dict): All kwargs are passed along to the downloader. At a minimum, these
-                include the :class:`~pulpcore.plugin.download.BaseDownloader` parameters.
+                include the [pulpcore.plugin.download.BaseDownloader][] parameters.
 
         Returns:
-            subclass of :class:`~pulpcore.plugin.download.BaseDownloader`: A downloader that
+            subclass of [pulpcore.plugin.download.BaseDownloader][]: A downloader that
             is configured with the remote settings.
         """
         kwargs["semaphore"] = self._semaphore
@@ -182,14 +183,14 @@ class DownloaderFactory:
         Build a downloader for http:// or https:// URLs.
 
         Args:
-            download_class (:class:`~pulpcore.plugin.download.BaseDownloader`): The download
+            download_class (pulpcore.plugin.download.BaseDownloader) The download
                 class to be instantiated.
             url (str): The download URL.
             kwargs (dict): All kwargs are passed along to the downloader. At a minimum, these
-                include the :class:`~pulpcore.plugin.download.BaseDownloader` parameters.
+                include the [pulpcore.plugin.download.BaseDownloader][] parameters.
 
         Returns:
-            :class:`~pulpcore.plugin.download.HttpDownloader`: A downloader that
+            [pulpcore.plugin.download.HttpDownloader][]: A downloader that
             is configured with the remote settings.
         """
         options = {"session": self._session}
@@ -214,14 +215,14 @@ class DownloaderFactory:
         Build a generic downloader based on the url.
 
         Args:
-            download_class (:class:`~pulpcore.plugin.download.BaseDownloader`): The download
+            download_class (pulpcore.plugin.download.BaseDownloader) The download
                 class to be instantiated.
             url (str): The download URL.
             kwargs (dict): All kwargs are passed along to the downloader. At a minimum, these
-                include the :class:`~pulpcore.plugin.download.BaseDownloader` parameters.
+                include the [pulpcore.plugin.download.BaseDownloader][] parameters.
 
         Returns:
-            subclass of :class:`~pulpcore.plugin.download.BaseDownloader`: A downloader that
+            subclass of [pulpcore.plugin.download.BaseDownloader][]: A downloader that
             is configured with the remote settings.
         """
         return download_class(url, **kwargs)
